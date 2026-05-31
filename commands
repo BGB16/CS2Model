@@ -113,3 +113,6 @@ python3 live_trader.py --contracts 100 --spread 4 --port 5052 --api-key-id 90ca9
 python3 hltv_map_monitor.py
 
 python3 auto_map_trader.py --contracts 150 --spread 4 --ttl 60 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt --poly-contracts 100
+
+# --- GIT ---
+git add -A && git commit -m "update" && git push
