@@ -1,0 +1,115 @@
+#!/bin/bash
+# ============================================================
+# KALSHI CS2 BOT - COMMAND CHEAT SHEET
+# ============================================================
+
+KEY="90ca9f68-5585-499e-93ca-e7bfbbce2147"
+PEM="/Users/blakegordon/PycharmProjects/CBAModel/key.pem"
+
+# --- SCRAPE match results from HLTV ---
+# python3 scrape_hltv.py                             # scrape last year
+# python3 scrape_hltv.py --pages 5                   # just 5 pages
+# python3 scrape_hltv.py --start 2025-01-01          # go back to this date
+# python3 scrape_hltv.py --check                     # data status
+# python3 scrape_hltv.py --reset                     # delete all scraped data
+
+# --- TRAIN the model ---
+# python3 train_model.py
+# python3 train_model.py --half-life 60 --alpha 1.0
+# python3 train_model.py rankings --top 30
+
+# --- PREDICT a matchup ---
+# python3 train_model.py predict "Vitality" "FaZe"
+# python3 train_model.py predict "Spirit" "MOUZ"
+# python3 train_model.py predict "navi" "Falcons"
+
+# --- FORFEIT RISK ---
+# python3 train_model.py forfeit                   # all teams ranked by P(ff)
+# python3 train_model.py forfeit "TeamName"         # specific team
+# python3 train_model.py forfeit --top 20           # top 20 riskiest
+
+
+# ============================================================
+# EDGE SCANNING (no trading)
+# ============================================================
+
+# --- SCAN for edges ---
+# python3 kalshi_edge.py scan
+# python3 kalshi_edge.py scan --min-edge 0.15
+
+# --- TOP 25 EDGES (sorted by size) ---
+# python3 kalshi_edge.py top
+# python3 kalshi_edge.py top --top 50
+
+
+# ============================================================
+# TRADING MODES
+# ============================================================
+
+# --- IOC TRADE (immediate-or-cancel) ---
+# python3 kalshi_edge.py trade --dry-run --api-key-id $KEY --private-key-path $PEM
+# python3 kalshi_edge.py trade --api-key-id $KEY --private-key-path $PEM
+
+# --- HOUSE MODE (dry run) ---
+# python3 kalshi_edge.py limit --dry-run --api-key-id $KEY --private-key-path $PEM
+
+# --- HOUSE MODE (live) ---
+python3 kalshi_edge.py limit --spread 6 --contracts 50 --max-contracts 100 --max-position 100 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem
+
+# --- HOUSE MODE (no book — fair minus spread only) ---
+python3 kalshi_edge.py limit --no-book --spread 6 --contracts 75 --max-contracts 300 --max-position 300 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt --poly-contracts 100
+
+
+# --- HOUSE MODE LOOP (every 10 min, cancels stale + reposts) ---
+# while python3 kalshi_edge.py limit --spread 4 --contracts 150 --max-contracts 600 --max-position 600 --api-key-id $KEY --private-key-path $PEM; do sleep 600; done
+
+
+# ============================================================
+# POSITIONS & MONITORING
+# ============================================================
+
+# Positions (risk analysis with model probabilities)
+# python3 kalshi_edge.py positions --api-key-id $KEY --private-key-path $PEM
+
+
+# ============================================================
+# CAP MANAGEMENT
+# ============================================================
+
+# View cap log
+# python3 kalshi_edge.py cap-log
+
+# Clear cap log + overrides
+# python3 kalshi_edge.py cap-log --reset
+
+# Set per-game cap override
+# python3 kalshi_edge.py cap-log --game "Vitality vs FaZe" 500
+
+
+# ============================================================
+# FULL PIPELINE (scrape -> train -> scan)
+# ============================================================
+
+# python3 scrape_hltv.py && python3 train_model.py && python3 kalshi_edge.py scan
+
+
+
+# ============================================================
+# LIVE TRADER
+# ============================================================
+
+# --- LIVE TRADER (dry run) ---
+# python3 live_trader.py --dry-run
+
+# --- LIVE TRADER (live) ---
+# python3 live_trader.py --api-key-id $KEY --private-key-path $PEM
+
+# --- LIVE TRADER (custom contracts/spread/port) ---
+python3 live_trader.py --contracts 100 --spread 4 --port 5052 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt
+
+# --- Start Chrome debug instance first (run once) ---
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --remote-allow-origins=\* --user-data-dir=/tmp/chrome_debug &
+
+python3 hltv_map_monitor.py
+
+python3 auto_map_trader.py --contracts 150 --spread 4 --ttl 60 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt --poly-contracts 100
