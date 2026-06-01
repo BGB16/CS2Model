@@ -1094,7 +1094,7 @@ def limit_cmd(args):
     _df_matches = load_matches()
     _train_df = build_training_data(_df_matches)
     team_match_counts = _train_df['team'].value_counts().to_dict()
-    MIN_TEAM_MATCHES = 10
+    MIN_TEAM_MATCHES = 25
 
     private_key = None
     if not args.dry_run:

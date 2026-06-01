@@ -416,8 +416,12 @@ def main():
             poly_client = PolyClient(args.poly_key_path)
             poly_client.start_heartbeat()
 
-    model, encoders, _ = load_model()
+    model, encoders, scale = load_model()
     model_team_names = list(encoders['team'].categories_[0])
+
+    from train_model import load_matches, build_training_data, resolve_team_name
+    _train_df = build_training_data(load_matches())
+    _match_counts = _train_df['team'].value_counts().to_dict()
 
     mode = "DRY RUN" if dry_run else "LIVE"
     score_src = "Polymarket" if use_poly_scores else "HLTV"
@@ -635,9 +639,20 @@ def main():
                     home_name = t1m or info['team1']
                     away_name = t2m or info['team2']
                     try:
-                        home_prob, _, _ = get_win_prob(model, encoders, home_name, away_name)
+                        home_prob, _, _ = get_win_prob(model, encoders, home_name, away_name, scale)
                     except Exception:
                         home_prob = 0.5
+
+                MIN_GAMES = 25
+                home_resolved = resolve_team_name(home_name, encoders) or home_name
+                away_resolved = resolve_team_name(away_name, encoders) or away_name
+                home_count = _match_counts.get(home_resolved, 0)
+                away_count = _match_counts.get(away_resolved, 0)
+                if home_count < MIN_GAMES or away_count < MIN_GAMES:
+                    print(f"    Insufficient data: {home_name}={home_count}, "
+                          f"{away_name}={away_count} (min {MIN_GAMES}) — skipping")
+                    posted_states.add(state_key)
+                    continue
 
                 wins_needed = 3 if is_bo5 else 2
                 if home_maps >= wins_needed or away_maps >= wins_needed:
