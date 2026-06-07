@@ -173,6 +173,11 @@ TEAM_ALIASES = {
     'navi': 'Natus Vincere',
     'na\'vi': 'Natus Vincere',
     'natus vincere': 'Natus Vincere',
+    'navi junior': 'NAVI Junior',
+    'natus vincere jr.': 'NAVI Junior',
+    'natus vincere jr': 'NAVI Junior',
+    'natus vincere junior': 'NAVI Junior',
+    'ex-navi junior': 'ex-NAVI Junior',
     'g2': 'G2',
     'g2 esports': 'G2',
     'faze': 'FaZe',
@@ -219,6 +224,14 @@ def resolve_team_name(query, encoders):
         if name.lower() == query_lower:
             return name
 
+    # Modifiers that distinguish separate orgs (e.g. "NAVI Junior" != "Natus Vincere")
+    _team_modifiers = {'junior', 'jr', 'jr.', 'academy', 'female', 'fe', 'rising'}
+
+    def _modifier_mismatch(a_tokens, b_tokens):
+        a_mods = a_tokens & _team_modifiers
+        b_mods = b_tokens & _team_modifiers
+        return a_mods != b_mods
+
     substring_matches = []
     for name in team_names:
         name_lower = name.lower()
@@ -227,6 +240,12 @@ def resolve_team_name(query, encoders):
         elif len(name_lower) >= 4 and name_lower in query_lower:
             substring_matches.append(name)
     if substring_matches:
+        q_tokens = set(query_lower.split())
+        filtered = [n for n in substring_matches
+                    if not _modifier_mismatch(q_tokens, set(n.lower().split()))]
+        if filtered:
+            filtered.sort(key=lambda n: -len(n))
+            return filtered[0]
         substring_matches.sort(key=lambda n: -len(n))
         return substring_matches[0]
 
@@ -234,6 +253,8 @@ def resolve_team_name(query, encoders):
     best_score, best_name = 0, None
     for name in team_names:
         name_tokens = set(name.lower().split())
+        if _modifier_mismatch(query_tokens, name_tokens):
+            continue
         overlap = len(query_tokens & name_tokens)
         min_tokens = min(len(query_tokens), len(name_tokens))
         if min_tokens > 0 and overlap >= max(1, min_tokens // 2 + 1):

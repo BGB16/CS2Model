@@ -260,6 +260,14 @@ def match_kalshi_team(kalshi_name, our_teams):
     for t in our_teams:
         if normalize_name(t) == norm:
             return t
+    # Modifiers that distinguish separate orgs (e.g. "NAVI Junior" != "Natus Vincere")
+    _team_modifiers = {'junior', 'jr', 'jr.', 'academy', 'female', 'fe', 'rising'}
+
+    def _modifier_mismatch(a_tokens, b_tokens):
+        a_mods = a_tokens & _team_modifiers
+        b_mods = b_tokens & _team_modifiers
+        return a_mods != b_mods
+
     # Substring match — require at least 4 chars to avoid "THE" matching "the last resort"
     matches = []
     for t in our_teams:
@@ -269,11 +277,20 @@ def match_kalshi_team(kalshi_name, our_teams):
         elif len(norm) >= 4 and norm in t_norm:
             matches.append(t)
     if matches:
+        norm_tokens = set(norm.split())
+        filtered = [t for t in matches
+                    if not _modifier_mismatch(norm_tokens, set(normalize_name(t).split()))]
+        if filtered:
+            filtered.sort(key=lambda t: -len(normalize_name(t)))
+            return filtered[0]
         matches.sort(key=lambda t: -len(normalize_name(t)))
         return matches[0]
     # Token overlap — require majority of tokens match
+    norm_tokens = set(norm.split())
     for t in our_teams:
         t_words = set(normalize_name(t).split())
+        if _modifier_mismatch(norm_tokens, t_words):
+            continue
         overlap = sum(1 for w in t_words if w in norm.split())
         if len(t_words) > 0 and overlap >= max(1, len(t_words) // 2 + 1):
             return t
@@ -389,6 +406,7 @@ def fetch_hltv_finished_teams():
         pass
 
     return finished
+
 
 
 def is_match_finished(t1, t2, finished_pairs):
@@ -700,6 +718,21 @@ def prob_under_2_5(p_series):
     Under 2.5 = either team wins 2-0 = p^2 + (1-p)^2."""
     p = series_prob_to_map_prob(p_series)
     return p * p + (1 - p) * (1 - p)
+
+
+def adjust_prob_for_format(prob_bo3, bo):
+    """Convert model's BO3 series probability to the correct format.
+    Model outputs P(win BO3). For BO1/BO5, derive map prob then recompute."""
+    if bo == 3:
+        return prob_bo3
+    p_map = series_prob_to_map_prob(prob_bo3)
+    if bo == 1:
+        return p_map
+    if bo == 5:
+        # P(win BO5) = p^3 * (1 + 3(1-p) + 6(1-p)^2)
+        q = 1 - p_map
+        return p_map**3 * (1 + 3*q + 6*q*q)
+    return prob_bo3
 
 
 # ============================================================
@@ -1113,6 +1146,7 @@ def limit_cmd(args):
                                build_poly_market_lookup, get_poly_orderbook, get_best_ask as poly_best_ask)
         if not args.dry_run:
             poly_client = PolyClient(poly_key_path)
+            poly_client.start_heartbeat()
         print(f"  [Poly] Enabled — ${poly_contracts}/side, max {poly_max_contracts}/game")
 
     prev_round_orders = {}
@@ -1126,7 +1160,8 @@ def limit_cmd(args):
         print(f"\n{'='*60}")
         print(f"  [HOUSE MODE - {mode}] Round {round_num} | "
               f"{now.strftime('%H:%M:%S')}")
-        print(f"  {args.contracts}/side | max {MAX_POS}/game | spread {args.spread}c")
+        bo_label = f" | BO{args.best_of}" if args.best_of != 3 else ""
+        print(f"  {args.contracts}/side | max {MAX_POS}/game | spread {args.spread}c{bo_label}")
         print(f"{'='*60}")
 
         if prev_round_orders and private_key and not args.dry_run:
@@ -1195,7 +1230,7 @@ def limit_cmd(args):
         poly_market_lookup = {}
         poly_positions = {}
         if poly_key_path:
-            poly_markets = fetch_poly_cs2_markets(pregame_only=True, our_teams=team_names)
+            poly_markets = fetch_poly_cs2_markets(pregame_only=True, today_only=False, our_teams=team_names)
             poly_market_lookup = build_poly_market_lookup(poly_markets)
             if poly_client or args.dry_run:
                 poly_positions = get_poly_cs2_positions(poly_client, team_names) if poly_client else {}
@@ -1273,6 +1308,16 @@ def limit_cmd(args):
                 print(f"  {away_k} vs {home_k} | SKIP — unmatched team ({', '.join(unmatched)})\n")
                 continue
 
+            skip_pairs = {frozenset({'hyperspirit', 'altreides'}), frozenset({'hyperspirit', 'atreides'})}
+            skip_events = {'KXCS2GAME-26JUN070700HSATR', 'KXCS2GAME-26JUN070700ATRAPOGEE'}
+            if event_key.upper() in skip_events:
+                print(f"  {away_k} vs {home_k} | SKIP — event blocklisted ({event_key})\n")
+                continue
+            pair_key = frozenset({home_matched.lower(), away_matched.lower()})
+            if pair_key in skip_pairs:
+                print(f"  {away_matched} vs {home_matched} | SKIP — blocklisted\n")
+                continue
+
             if forfeited_teams:
                 if home_matched.lower() in forfeited_teams or away_matched.lower() in forfeited_teams:
                     ff_team = home_matched if home_matched.lower() in forfeited_teams else away_matched
@@ -1334,8 +1379,21 @@ def limit_cmd(args):
 
             game_key = '|'.join(sorted([home_matched, away_matched]))
 
+            # Detect BO format from Polymarket title (e.g. "(BO1) - IEM Cologne Major")
+            match_bo = getattr(args, 'best_of', 3)
+            pm = poly_market_lookup.get(game_key) if poly_market_lookup else None
+            if pm:
+                ptitle = pm.get('title', '').lower()
+                if '(bo1)' in ptitle:
+                    match_bo = 1
+                elif '(bo5)' in ptitle:
+                    match_bo = 5
+                elif '(bo3)' in ptitle:
+                    match_bo = 3
+
             # Compute model probability ONCE for this match
-            prob_home, _, _ = get_win_prob(model, encoders, home_matched, away_matched, scale)
+            prob_home_bo3, _, _ = get_win_prob(model, encoders, home_matched, away_matched, scale)
+            prob_home = adjust_prob_for_format(prob_home_bo3, match_bo)
             prob_away = 1 - prob_home
 
             ff_block_home = ff_home_prob >= FF_RATE_THRESHOLD
@@ -1364,7 +1422,8 @@ def limit_cmd(args):
                 ff_str += f" | FF-BLOCK {home_matched}({ff_home_prob:.0%})"
             if ff_block_away:
                 ff_str += f" | FF-BLOCK {away_matched}({ff_away_prob:.0%})"
-            print(f"  {matchup} | {held_str}{mult_str} | home={prob_home:.0%} away={prob_away:.0%}{ff_str}")
+            bo_tag = f" [BO{match_bo}]" if match_bo != 3 else ""
+            print(f"  {matchup} | {held_str}{mult_str} | home={prob_home:.0%} away={prob_away:.0%}{bo_tag}{ff_str}")
 
             if game_room == 0:
                 if private_key and not args.dry_run:
@@ -1417,8 +1476,8 @@ def limit_cmd(args):
                 yes_bid = max(1, yes_bid)
                 no_bid = max(1, no_bid)
 
-                skip_yes = yes_bid <= 2
-                skip_no = no_bid <= 2
+                skip_yes = yes_bid <= 2 or (fair_yes - spread_cents) < 1
+                skip_no = no_bid <= 2 or (fair_no - spread_cents) < 1
 
                 if yes_is_home and ff_block_home:
                     skip_yes = True
@@ -1474,7 +1533,6 @@ def limit_cmd(args):
                     total_pairs += 1
 
             # --- Polymarket orders for this game ---
-            pm = poly_market_lookup.get(game_key) if poly_market_lookup else None
             if pm:
                 gs = pm.get('game_start_time')
                 if gs and (gs - now).total_seconds() < 1200:
@@ -1492,11 +1550,13 @@ def limit_cmd(args):
                 # Determine which poly outcome is home
                 poly_home = match_kalshi_team(pm['team_a'], team_names)
                 if poly_home == home_matched:
-                    poly_bid_a = round(max(0.01, poly_fair_a - poly_spread_dec), 2)
-                    poly_bid_b = round(max(0.01, poly_fair_b - poly_spread_dec), 2)
+                    raw_fair_a, raw_fair_b = poly_fair_a, poly_fair_b
+                    poly_bid_a = round(max(0.01, raw_fair_a - poly_spread_dec), 2)
+                    poly_bid_b = round(max(0.01, raw_fair_b - poly_spread_dec), 2)
                 else:
-                    poly_bid_a = round(max(0.01, poly_fair_b - poly_spread_dec), 2)
-                    poly_bid_b = round(max(0.01, poly_fair_a - poly_spread_dec), 2)
+                    raw_fair_a, raw_fair_b = poly_fair_b, poly_fair_a
+                    poly_bid_a = round(max(0.01, raw_fair_a - poly_spread_dec), 2)
+                    poly_bid_b = round(max(0.01, raw_fair_b - poly_spread_dec), 2)
 
                 ob_a = get_poly_orderbook(pm['token_a'])
                 ob_b = get_poly_orderbook(pm['token_b'])
@@ -1514,8 +1574,8 @@ def limit_cmd(args):
 
                 poly_room = max(0, poly_max_contracts - int(poly_held))
                 poly_size = min(poly_contracts, poly_room, game_room)
-                skip_a = poly_size < 5 or poly_bid_a <= 0.02 or (ff_block_home if poly_home == home_matched else ff_block_away)
-                skip_b = poly_size < 5 or poly_bid_b <= 0.02 or (ff_block_away if poly_home == home_matched else ff_block_home)
+                skip_a = poly_size < 5 or poly_bid_a <= 0.02 or (raw_fair_a - poly_spread_dec) < 0.01 or (ff_block_home if poly_home == home_matched else ff_block_away)
+                skip_b = poly_size < 5 or poly_bid_b <= 0.02 or (raw_fair_b - poly_spread_dec) < 0.01 or (ff_block_away if poly_home == home_matched else ff_block_home)
 
                 print(f"    [POLY] {pm['team_a']}={poly_bid_a:.2f} (ask={ask_a:.2f}) | "
                       f"{pm['team_b']}={poly_bid_b:.2f} (ask={ask_b:.2f}) | ${poly_size}/side")
@@ -1615,6 +1675,8 @@ def limit_cmd(args):
 
                     ss_mult_po = sample_size_spread_multiplier(home_count, away_count)
                     poly_spread_dec = (args.spread * ss_mult_po) / 100
+                    skip_po_a = (fair_a - poly_spread_dec) < 0.01
+                    skip_po_b = (fair_b - poly_spread_dec) < 0.01
                     bid_a = round(max(0.01, fair_a - poly_spread_dec), 2)
                     bid_b = round(max(0.01, fair_b - poly_spread_dec), 2)
 
@@ -1641,7 +1703,7 @@ def limit_cmd(args):
                         continue
 
                     if poly_client or args.dry_run:
-                        if bid_a > 0.02:
+                        if bid_a > 0.02 and not skip_po_a:
                             if poly_client:
                                 poly_client.cancel_token_orders(pm['token_a'])
                                 poly_client.place_order(
@@ -1651,7 +1713,7 @@ def limit_cmd(args):
                             elif args.dry_run:
                                 print(f"    [DRY RUN] POLY BUY ${p_size_g} {pm['team_a']} @ {bid_a:.2f}")
                             total_orders += 1
-                        if bid_b > 0.02:
+                        if bid_b > 0.02 and not skip_po_b:
                             if poly_client:
                                 poly_client.cancel_token_orders(pm['token_b'])
                                 poly_client.place_order(
@@ -1679,6 +1741,14 @@ def limit_cmd(args):
             away_m = match_kalshi_team(away_k, team_names)
             home_m = match_kalshi_team(home_k, team_names)
             if not away_m or not home_m:
+                continue
+
+            home_count = team_match_counts.get(home_m, 0)
+            away_count = team_match_counts.get(away_m, 0)
+            if home_count < MIN_TEAM_MATCHES or away_count < MIN_TEAM_MATCHES:
+                low_team = home_m if home_count < away_count else away_m
+                low_count = min(home_count, away_count)
+                print(f"    [U2.5] {away_m} vs {home_m} | SKIP ({low_team} only {low_count} matches)")
                 continue
 
             if is_match_finished(home_m, away_m, finished_pairs) or \
@@ -2043,6 +2113,8 @@ def main():
                     help='Polymarket private key file (enables dual-exchange)')
     mm.add_argument('--poly-contracts', type=int, default=None,
                     help='Polymarket $ per side (default: same as --contracts)')
+    mm.add_argument('--best-of', type=int, default=3, choices=[1, 3, 5],
+                    help='Match format (default: 3, use 1 for Major stages)')
 
     cl = sub.add_parser('cap-log', help='Review cap hit log / set overrides')
     cl.add_argument('--clear', action='store_true')

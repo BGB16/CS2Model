@@ -257,7 +257,8 @@ def _weapon_is_default(weapon_name):
 
 def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
                                home_is_ct, home_rounds, away_rounds,
-                               bomb_planted=False, timer_seconds=-1):
+                               bomb_planted=False, timer_seconds=-1,
+                               round_history=None, ct_round_rate=None):
     """Adjust live map probability based on economy/weapons/bomb/timer.
 
     Computes:
@@ -331,24 +332,50 @@ def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
         t_avg = t_info['avg_money']
 
         if ct_won is not None:
-            # Project next-round money for each player.
-            # Winners get $3250, losers get loss bonus ($1400-$3400 based on streak).
-            # Estimate loss streak from recent economy trajectory:
-            # if the losing team had high avg money, they just lost a buy (streak=1).
-            # if they had low money, they've been losing (higher streak).
-            def _est_loss_bonus(loser_avg, winner_avg):
-                """Estimate loss bonus from the loser's current avg money."""
-                # High money -> just lost first buy -> low streak
-                # Mid money -> couple losses -> mid streak
-                # Very low money -> long streak or just lost after eco
+            # Count consecutive losses from round history for accurate loss bonus
+            def _loss_streak_from_history(loser_side, rh):
+                """Count consecutive losses for loser_side from most recent rounds."""
+                streak = 0
+                for r in reversed(rh):
+                    if r.get('winner') == loser_side:
+                        break
+                    if r.get('winner') and r['winner'] != loser_side:
+                        streak += 1
+                    else:
+                        break
+                return streak
+
+            def _had_bomb_plant(rh, round_num):
+                """Check if bomb was planted in a specific round from history."""
+                for r in rh:
+                    if r.get('round') == round_num:
+                        return r.get('win_type') in ('bomb', 'defuse')
+                return False
+
+            ct_loss_streak = 0
+            t_loss_streak = 0
+            if round_history and len(round_history) > 0:
+                ct_loss_streak = _loss_streak_from_history('ct', round_history)
+                t_loss_streak = _loss_streak_from_history('t', round_history)
+
+            def _get_loss_bonus(side, loser_avg):
+                """Get loss bonus from round history streak or estimate from money."""
+                streak = ct_loss_streak if side == 'ct' else t_loss_streak
+                if streak > 0:
+                    return LOSS_BONUS[min(streak - 1, len(LOSS_BONUS) - 1)]
                 if loser_avg >= 3000:
-                    return LOSS_BONUS[0]  # $1400 — first loss, had money
+                    return LOSS_BONUS[0]
                 elif loser_avg >= 2000:
-                    return LOSS_BONUS[1]  # $1900
+                    return LOSS_BONUS[1]
                 elif loser_avg >= 1000:
-                    return LOSS_BONUS[2]  # $2400
+                    return LOSS_BONUS[2]
                 else:
-                    return LOSS_BONUS[3]  # $2900 — been losing a while
+                    return LOSS_BONUS[3]
+
+            # Check bomb plant from round history if not detected live
+            rh = round_history or []
+            cur_round = home_rounds + away_rounds
+            bomb_in_round = bomb_planted or _had_bomb_plant(rh, cur_round)
 
             ct_projected = []
             for p in ct_players:
@@ -356,7 +383,7 @@ def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
                 if ct_won:
                     m += WIN_REWARD
                 else:
-                    m += _est_loss_bonus(ct_avg, t_avg)
+                    m += _get_loss_bonus('ct', ct_avg)
                 ct_projected.append(min(MAX_MONEY, m))
 
             t_projected = []
@@ -364,11 +391,11 @@ def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
                 m = p.get('money', 0)
                 if not ct_won:
                     m += WIN_REWARD
-                    if bomb_planted:
+                    if bomb_in_round:
                         m += PLANT_BONUS
                 else:
-                    m += _est_loss_bonus(t_avg, ct_avg)
-                    if bomb_planted:
+                    m += _get_loss_bonus('t', t_avg)
+                    if bomb_in_round:
                         m += PLANT_BONUS
                 t_projected.append(min(MAX_MONEY, m))
 
@@ -502,8 +529,10 @@ def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
     # One round of EV barely moves the map price. But a round's outcome
     # determines the economy for the NEXT round, which determines buy levels.
     # Project forward 2 rounds using economy to estimate buy matchups.
-    p_map_if_win = live_round_win_prob(home_rounds + 1, away_rounds, base_map_prob)
-    p_map_if_lose = live_round_win_prob(home_rounds, away_rounds + 1, base_map_prob)
+    p_map_if_win = live_round_win_prob(home_rounds + 1, away_rounds, base_map_prob,
+                                       home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+    p_map_if_lose = live_round_win_prob(home_rounds, away_rounds + 1, base_map_prob,
+                                         home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
     expected_map_p = home_round_p * p_map_if_win + (1 - home_round_p) * p_map_if_lose
 
     if phase == 'live' and total_rounds < 24:
@@ -549,13 +578,17 @@ def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
 
         # 2-round lookahead: for each path (win/lose this round), project next round
         # Path A: home wins R1, then R2 outcome
-        p_map_win_win = live_round_win_prob(home_rounds + 2, away_rounds, base_map_prob)
-        p_map_win_lose = live_round_win_prob(home_rounds + 1, away_rounds + 1, base_map_prob)
+        p_map_win_win = live_round_win_prob(home_rounds + 2, away_rounds, base_map_prob,
+                                             home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+        p_map_win_lose = live_round_win_prob(home_rounds + 1, away_rounds + 1, base_map_prob,
+                                              home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
         p_map_after_win = r2_home_p_if_won * p_map_win_win + (1 - r2_home_p_if_won) * p_map_win_lose
 
         # Path B: home loses R1, then R2 outcome
-        p_map_lose_win = live_round_win_prob(home_rounds + 1, away_rounds + 1, base_map_prob)
-        p_map_lose_lose = live_round_win_prob(home_rounds, away_rounds + 2, base_map_prob)
+        p_map_lose_win = live_round_win_prob(home_rounds + 1, away_rounds + 1, base_map_prob,
+                                              home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+        p_map_lose_lose = live_round_win_prob(home_rounds, away_rounds + 2, base_map_prob,
+                                               home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
         p_map_after_lose = r2_home_p_if_lost * p_map_lose_win + (1 - r2_home_p_if_lost) * p_map_lose_lose
 
         expected_map_p_2 = home_round_p * p_map_after_win + (1 - home_round_p) * p_map_after_lose
@@ -739,11 +772,16 @@ def _ot_win_prob(p):
     return _rec(0, 0) or 0.5
 
 
-def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob):
+def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob,
+                        home_is_ct=None, ct_round_rate=None):
     """Live map win probability given round score.
     Regulation: MR12, first to 13 wins. If 12-12 → overtime.
     OT: MR3 sets (6 rounds), win by 2. If 3-3 in OT set, new set starts.
-    Derives per-round win rate from base_map_prob via brentq."""
+    Derives per-round win rate from base_map_prob via brentq.
+
+    When home_is_ct and ct_round_rate are provided, uses side-aware round
+    probabilities: different p_round for first half vs second half to
+    account for the halftime side swap."""
     if team1_rounds == 0 and team2_rounds == 0:
         return base_map_prob
 
@@ -779,29 +817,23 @@ def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob):
     except Exception:
         p_round = clamped
 
-    def _is_map_won(h, a):
-        """Check if score h-a means team1 won the map."""
-        if h <= 12 and a <= 12:
-            return h >= 13  # impossible in regulation <=12
-        # Regulation win: 13-x where x <= 11
-        if h >= 13 and a <= 11:
-            return True
-        if a >= 13 and h <= 11:
-            return False
-        # OT: both >= 12. Win requires >= 16 AND lead >= 2
-        # (each OT set adds up to 6 rounds from a 12-12 / 15-15 / 18-18 base)
-        if h >= 13 and a >= 12:
-            if h - a >= 2 and (h - 12) % 3 == 0 and (a - 12) % 3 == 0:
-                return True  # clean OT set win at boundary
-            if h - a >= 2 and h >= 16:
-                # Check if at an OT set boundary
-                ot_h, ot_a = h - 12, a - 12
-                # OT sets are 6 rounds from the tie point
-                # set boundaries at total OT rounds = 6, 12, 18...
-                total_ot = ot_h + ot_a
-                # Win at any point with +2 lead at set end or during sudden-death
-                return True
-        return None  # not decided
+    # Side-aware round probabilities for halftime flip.
+    # home_is_ct reflects the CURRENT side (HLTV flips at halftime).
+    # Determine first-half side from current side + which half we're in.
+    if home_is_ct is not None and ct_round_rate is not None:
+        ct_bonus = ct_round_rate - 0.50
+        total = team1_rounds + team2_rounds
+        first_half_ct = home_is_ct if total < 12 else (not home_is_ct)
+        if first_half_ct:
+            p_h1 = max(0.01, min(0.99, p_round + ct_bonus))
+            p_h2 = max(0.01, min(0.99, p_round - ct_bonus))
+        else:
+            p_h1 = max(0.01, min(0.99, p_round - ct_bonus))
+            p_h2 = max(0.01, min(0.99, p_round + ct_bonus))
+    else:
+        p_h1 = p_round
+        p_h2 = p_round
+    p_ot = p_round
 
     def _from_state(h, a):
         # Regulation: not yet 12-12
@@ -818,18 +850,19 @@ def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob):
                 if ra >= 13:
                     return 0.0
                 if rh == 12 and ra == 12:
-                    return _ot_win_prob(p_round)
+                    return _ot_win_prob(p_ot)
                 if (rh, ra) in memo:
                     return memo[(rh, ra)]
-                memo[(rh, ra)] = (p_round * _reg(rh + 1, ra) +
-                                  (1 - p_round) * _reg(rh, ra + 1))
+                p = p_h1 if (rh + ra) < 12 else p_h2
+                memo[(rh, ra)] = (p * _reg(rh + 1, ra) +
+                                  (1 - p) * _reg(rh, ra + 1))
                 return memo[(rh, ra)]
 
             return _reg(h, a)
 
         # In OT: both >= 12
         if h == 12 and a == 12:
-            return _ot_win_prob(p_round)
+            return _ot_win_prob(p_ot)
 
         ot_h = h - 12
         ot_a = a - 12
@@ -852,7 +885,7 @@ def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob):
                 if diff <= -2:
                     return 0.0
                 # 3-3 tie: new OT set with same per-round prob
-                return _ot_win_prob(p_round)
+                return _ot_win_prob(p_ot)
             # Early clinch: can't lose even if opponent wins remaining
             remaining = 6 - oh - oa
             if oh - oa > remaining:
@@ -861,8 +894,8 @@ def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob):
                 return 0.0
             if (oh, oa) in ot_memo:
                 return ot_memo[(oh, oa)]
-            ot_memo[(oh, oa)] = (p_round * _ot_rec(oh + 1, oa) +
-                                 (1 - p_round) * _ot_rec(oh, oa + 1))
+            ot_memo[(oh, oa)] = (p_ot * _ot_rec(oh + 1, oa) +
+                                 (1 - p_ot) * _ot_rec(oh, oa + 1))
             return ot_memo[(oh, oa)]
 
         return _ot_rec(rh, ra)
@@ -1002,22 +1035,28 @@ def place_tracked_order(ticker, side, count, price_cents):
         'count': count, 'type': 'limit', 'yes_price': yes_price,
         'client_order_id': f"cs2-live-{uuid.uuid4()}",
     }
-    headers = make_auth_headers(PRIVATE_KEY, API_KEY_ID, 'POST', path)
-    try:
-        resp = http_requests.post(url, headers=headers, json=order, timeout=10)
-    except Exception as e:
-        print(f"      FAILED: {e}")
+    for attempt in range(4):
+        headers = make_auth_headers(PRIVATE_KEY, API_KEY_ID, 'POST', path)
+        try:
+            resp = http_requests.post(url, headers=headers, json=order, timeout=10)
+        except Exception as e:
+            print(f"      FAILED: {e}")
+            return False
+        if resp.status_code == 201:
+            oid = resp.json().get('order', {}).get('order_id', '?')
+            print(f"      ORDER {oid} {side.upper()} @ {price_cents}c")
+            with PLACED_ORDER_LOCK:
+                PLACED_ORDER_IDS.append({
+                    'oid': oid, 'ticker': ticker,
+                    'side': side, 'yes_price': yes_price,
+                })
+            return True
+        if resp.status_code == 429:
+            time.sleep(0.3 * (attempt + 1))
+            continue
+        print(f"      FAILED: {resp.status_code} {resp.text[:200]}")
         return False
-    if resp.status_code == 201:
-        oid = resp.json().get('order', {}).get('order_id', '?')
-        print(f"      ORDER {oid} {side.upper()} @ {price_cents}c")
-        with PLACED_ORDER_LOCK:
-            PLACED_ORDER_IDS.append({
-                'oid': oid, 'ticker': ticker,
-                'side': side, 'yes_price': yes_price,
-            })
-        return True
-    print(f"      FAILED: {resp.status_code} {resp.text[:200]}")
+    print(f"      FAILED: rate limited after 4 retries")
     return False
 
 
@@ -1117,12 +1156,17 @@ def cancel_all_live_orders(tickers=None):
     return 1, msg
 
 
+LAYER_COUNT = 4
+
+
 def post_live_orders(tickers_list, home_fair_cents, contracts, spread_cents,
                      home_name='HOME', away_name='AWAY'):
     """Post maker-only limit orders. Caps price at best_ask - 1 to never cross."""
     away_fair_cents = 100 - home_fair_cents
     home_bid = home_fair_cents - spread_cents
     away_bid = away_fair_cents - spread_cents
+    skip_home = (home_fair_cents - spread_cents) < 1
+    skip_away = (away_fair_cents - spread_cents) < 1
 
     orders_to_place = []
     for t in tickers_list:
@@ -1134,13 +1178,14 @@ def post_live_orders(tickers_list, home_fair_cents, contracts, spread_cents,
         no_team = away_name if home_is_yes else home_name
         yes_fair = home_fair_cents if home_is_yes else away_fair_cents
         no_fair = away_fair_cents if home_is_yes else home_fair_cents
+        yes_skip = skip_home if home_is_yes else skip_away
+        no_skip = skip_away if home_is_yes else skip_home
 
         if yes_bid > yes_fair:
             yes_bid = yes_fair
         if no_bid > no_fair:
             no_bid = no_fair
 
-        # Fetch orderbook to cap at best_ask - 1 (maker only)
         ob = _fetch_orderbook_prices(ticker)
         if ob:
             if ob['yes_best_ask'] is not None:
@@ -1156,12 +1201,12 @@ def post_live_orders(tickers_list, home_fair_cents, contracts, spread_cents,
                           f"(ask={ob['no_best_ask']}c)")
                     no_bid = maker_cap_no
 
-        if 1 <= yes_bid <= 99:
+        if 1 <= yes_bid <= 99 and not yes_skip:
             orders_to_place.append({
                 'ticker': ticker, 'side': 'yes', 'price': yes_bid,
                 'team': f"{yes_team} YES", 'fair': yes_fair,
             })
-        if 1 <= no_bid <= 99:
+        if 1 <= no_bid <= 99 and not no_skip:
             orders_to_place.append({
                 'ticker': ticker, 'side': 'no', 'price': no_bid,
                 'team': f"{no_team} NO", 'fair': no_fair,
@@ -1191,6 +1236,8 @@ def post_ioc_orders(tickers_list, home_fair_cents, contracts, spread_cents,
                     home_name='HOME', away_name='AWAY'):
     """Post IOC orders concurrently."""
     away_fair_cents = 100 - home_fair_cents
+    skip_home = (home_fair_cents - spread_cents) < 1
+    skip_away = (away_fair_cents - spread_cents) < 1
     home_bid = max(1, home_fair_cents - spread_cents)
     away_bid = max(1, away_fair_cents - spread_cents)
 
@@ -1204,18 +1251,20 @@ def post_ioc_orders(tickers_list, home_fair_cents, contracts, spread_cents,
         no_team = away_name if home_is_yes else home_name
         yes_fair = home_fair_cents if home_is_yes else away_fair_cents
         no_fair = away_fair_cents if home_is_yes else home_fair_cents
+        yes_skip = skip_home if home_is_yes else skip_away
+        no_skip = skip_away if home_is_yes else skip_home
 
         if yes_bid > yes_fair:
             yes_bid = yes_fair
         if no_bid > no_fair:
             no_bid = no_fair
 
-        if 1 <= yes_bid <= 99:
+        if 1 <= yes_bid <= 99 and not yes_skip:
             orders_to_place.append({
                 'ticker': ticker, 'side': 'yes', 'price': yes_bid,
                 'team': f"{yes_team} YES", 'fair': yes_fair,
             })
-        if 1 <= no_bid <= 99:
+        if 1 <= no_bid <= 99 and not no_skip:
             orders_to_place.append({
                 'ticker': ticker, 'side': 'no', 'price': no_bid,
                 'team': f"{no_team} NO", 'fair': no_fair,
@@ -1318,30 +1367,34 @@ class HLTVScoreboard:
             return
 
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=False, args=[
-                '--disable-blink-features=AutomationControlled',
-            ])
-            ctx = browser.new_context(
-                user_agent=(
-                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/131.0.0.0 Safari/537.36'),
-                viewport={'width': 1280, 'height': 900},
-            )
+            try:
+                browser = pw.chromium.connect_over_cdp("http://localhost:9222")
+                print("[HLTV] Connected to Chrome debug instance")
+            except Exception as e:
+                print(f"[HLTV] Could not connect to Chrome debug (is it running on port 9222?): {e}")
+                self._running = False
+                return
+
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
             page = ctx.new_page()
-            # Hide webdriver flag
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            """)
+
             full_url = f'{HLTV_BASE}{match_url}'
             print(f"[HLTV] Navigating to {full_url}")
 
             try:
                 page.goto(full_url, timeout=30000, wait_until='domcontentloaded')
-                time.sleep(4)
+                # Wait for Cloudflare challenge
+                for _ in range(30):
+                    if 'just a moment' not in (page.title() or '').lower():
+                        break
+                    time.sleep(1)
+                time.sleep(3)
             except Exception as e:
                 print(f"[HLTV] Navigation error: {e}")
-                browser.close()
+                try:
+                    page.close()
+                except Exception:
+                    pass
                 self._running = False
                 return
 
@@ -1360,14 +1413,16 @@ class HLTVScoreboard:
                 time.sleep(1.5)
 
             if not loaded:
-                # Check if scorebot element exists at all
                 sbe = page.query_selector('#scoreboardElement')
                 if sbe:
                     print(f"[HLTV] Scorebot element found but no player rows after 30s")
                     print(f"[HLTV] Continuing anyway — data may populate during match")
                 else:
                     print("[HLTV] No scorebot element found — stopping")
-                    browser.close()
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
                     self._running = False
                     return
 
@@ -1380,26 +1435,21 @@ class HLTVScoreboard:
                     t_alive = sum(1 for p in state.get('t_players', []) if p.get('alive'))
                     round_live = ct_alive > 0 and t_alive > 0
 
-                    # Reset bomb lock when round number changes
                     if cur_round != self._prev_round:
                         self._bomb_locked = False
                         self._timer_stall_count = 0
                     self._prev_round = cur_round
 
-                    # Once bomb is detected in a round, lock it on for the rest of that round
                     if self._bomb_locked:
                         state['bomb_planted'] = True
                         state['bomb_source'] = 'locked'
                     elif round_live and timer_s >= 0 and self._prev_timer is not None:
                         prev = self._prev_timer
-                        # Timer stall: same value for 2+ polls
                         if timer_s == prev:
                             self._timer_stall_count += 1
                         else:
                             self._timer_stall_count = 0
 
-                        # Big timer drop: round clock (1:55) suddenly becomes C4 fuse (~0:40)
-                        # A drop of 30+ seconds in one poll interval = bomb planted
                         timer_jump = prev - timer_s > 30 and timer_s <= 45
 
                         if self._timer_stall_count >= 2 or timer_jump:
@@ -1409,7 +1459,6 @@ class HLTVScoreboard:
                     else:
                         self._timer_stall_count = 0
 
-                    # CSS detection from _parse can also lock the bomb
                     if state.get('bomb_planted') and not self._bomb_locked and round_live:
                         self._bomb_locked = True
                         state['bomb_source'] = state.get('bomb_source', 'css')
@@ -1424,7 +1473,10 @@ class HLTVScoreboard:
                     traceback.print_exc()
                 time.sleep(0.8)
 
-            browser.close()
+            try:
+                page.close()
+            except Exception:
+                pass
 
     def _parse(self, page):
         # Single JS evaluate — much faster than many query_selector calls
@@ -1507,6 +1559,63 @@ class HLTVScoreboard:
                         if (mapInfo.name || ms1 + ms2 > 0) s.maps.push(mapInfo);
                     } catch(e) {}
                 });
+            } catch(e) {}
+
+            // Round history — parse the game log icons
+            s.round_history = [];
+            try {
+                document.querySelectorAll('.roundHistoryTeamRow, .round-history-team-row').forEach(teamRow => {
+                    const teamClass = (teamRow.className || '');
+                    // First row is typically team1 (top), second is team2 (bottom)
+                    teamRow.querySelectorAll('.roundHistory .round-icon, .round-history-icon, [class*="roundIcon"], img[src*="icon"]').forEach(icon => {
+                        // Already captured via other method below
+                    });
+                });
+                // HLTV scorebot round history: .roundHistory contains round result icons
+                // Each round has a div/img with class or src indicating: ct_win, t_win, bomb, defuse, etc.
+                const roundCols = document.querySelectorAll('.roundHistory .col, .roundHistoryLine .col, [class*="roundHistory"] [class*="col"]');
+                if (roundCols.length > 0) {
+                    roundCols.forEach((col, idx) => {
+                        const rnd = {round: idx + 1, winner: '', win_type: ''};
+                        const img = col.querySelector('img');
+                        const cls = (col.className || '') + ' ' + (col.innerHTML || '');
+                        if (img) {
+                            const src = (img.src || img.getAttribute('src') || '').toLowerCase();
+                            if (src.includes('bomb_explode') || src.includes('t_bomb')) { rnd.winner = 't'; rnd.win_type = 'bomb'; }
+                            else if (src.includes('bomb_defuse') || src.includes('ct_defuse')) { rnd.winner = 'ct'; rnd.win_type = 'defuse'; }
+                            else if (src.includes('ct_icon') || src.includes('ct_win') || src.includes('icon_ct')) { rnd.winner = 'ct'; rnd.win_type = 'elim'; }
+                            else if (src.includes('t_icon') || src.includes('t_win') || src.includes('icon_t')) { rnd.winner = 't'; rnd.win_type = 'elim'; }
+                            else if (src.includes('stopwatch') || src.includes('timeout') || src.includes('timer')) { rnd.winner = 'ct'; rnd.win_type = 'time'; }
+                        }
+                        if (!rnd.winner) {
+                            const lc = cls.toLowerCase();
+                            if (lc.includes('ct')) rnd.winner = 'ct';
+                            else if (lc.includes('t_') || lc.match(/\\bt\\b/)) rnd.winner = 't';
+                            if (lc.includes('bomb') && !lc.includes('defuse')) rnd.win_type = 'bomb';
+                            else if (lc.includes('defuse')) rnd.win_type = 'defuse';
+                            else if (lc.includes('time') || lc.includes('stopwatch')) rnd.win_type = 'time';
+                            else rnd.win_type = 'elim';
+                        }
+                        if (rnd.winner) s.round_history.push(rnd);
+                    });
+                }
+                // Fallback: parse from the round-history-line bars (each half has a row per team)
+                if (s.round_history.length === 0) {
+                    const lines = document.querySelectorAll('.round-history-line, .roundHistoryLine');
+                    lines.forEach(line => {
+                        line.querySelectorAll('img').forEach((img, idx) => {
+                            const src = (img.src || '').toLowerCase();
+                            const title = (img.title || img.alt || '').toLowerCase();
+                            const rnd = {round: s.round_history.length + 1, winner: '', win_type: ''};
+                            if (src.includes('bomb_explode') || title.includes('bomb')) { rnd.winner = 't'; rnd.win_type = 'bomb'; }
+                            else if (src.includes('bomb_defuse') || title.includes('defuse')) { rnd.winner = 'ct'; rnd.win_type = 'defuse'; }
+                            else if (src.includes('ct') || title.includes('ct')) { rnd.winner = 'ct'; rnd.win_type = 'elim'; }
+                            else if (src.includes('t_') || title.includes('terrorist')) { rnd.winner = 't'; rnd.win_type = 'elim'; }
+                            else if (src.includes('stopwatch') || title.includes('time')) { rnd.winner = 'ct'; rnd.win_type = 'time'; }
+                            if (rnd.winner) s.round_history.push(rnd);
+                        });
+                    });
+                }
             } catch(e) {}
 
             const BASE = 'https://www.hltv.org';
@@ -1592,21 +1701,18 @@ class HLTVScoreboard:
 
 
 def fetch_hltv_live_matches():
-    """Scrape HLTV /matches for currently live matches."""
+    """Scrape HLTV /matches via Chrome debug for currently live matches."""
     try:
-        from curl_cffi import requests as cffi_requests
         from bs4 import BeautifulSoup
+        from hltv_map_monitor import get_hltv_browser, close_hltv_browser
     except ImportError:
         return []
 
     try:
-        session = cffi_requests.Session()
-        resp = session.get(f'{HLTV_BASE}/matches', impersonate='chrome131',
-                           timeout=30, headers={'Referer': f'{HLTV_BASE}/'})
-        if resp.status_code != 200:
-            return []
+        browser = get_hltv_browser()
+        html = browser.get_page_html(f'{HLTV_BASE}/matches', timeout=30000)
+        soup = BeautifulSoup(html, 'html.parser')
 
-        soup = BeautifulSoup(resp.text, 'html.parser')
         live_section = soup.find('div', class_='liveMatches')
         if not live_section:
             return []
@@ -1900,6 +2006,7 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
 .brk-champ-bar-fill { height: 100%; border-radius: 4px;
     background: linear-gradient(90deg, #4fc3f7, #81c784); }
 
+.futures-event-row:hover { border-color: #4fc3f7 !important; }
 .swiss-panel { padding: 10px 0; }
 .swiss-stage { background: #111; border: 1px solid #333; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
 .swiss-stage-hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
@@ -1939,6 +2046,7 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
         <button class="tab" onclick="switchTab('predict')">Predict</button>
         <button class="tab" onclick="switchTab('bracket')">Bracket Builder</button>
         <button class="tab" onclick="switchTab('futures')">Futures</button>
+        <button class="tab" onclick="switchTab('forfeit')">Forfeit</button>
     </div>
 
     <div id="tab-predict" style="display:none;">
@@ -1954,6 +2062,14 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
                 <label>Team B</label>
                 <input type="text" id="pred-team-b" list="team-list-b" placeholder="Search..." style="width:200px;">
                 <datalist id="team-list-b"></datalist>
+            </div>
+            <div class="input-group">
+                <label>Format</label>
+                <select id="pred-format" style="width:90px; padding:6px 8px; background:#1a1a2e; color:#e0e0e0; border:1px solid #333; border-radius:4px;">
+                    <option value="bo1">BO1</option>
+                    <option value="bo3" selected>BO3</option>
+                    <option value="bo5">BO5</option>
+                </select>
             </div>
             <button class="btn btn-compute" onclick="runPredict()">Predict</button>
         </div>
@@ -2028,13 +2144,13 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
     <div id="tab-futures" style="display:none;">
         <h1 style="color: #4fc3f7; margin-bottom: 4px;">Futures / Props Trading</h1>
         <p style="font-size: 12px; color: #888; margin-bottom: 14px;">
-            Paste a Polymarket event URL or Kalshi event ticker to load all sub-markets.
+            Type "kalshi" to load all CS2 futures, or paste a Polymarket event URL.
         </p>
 
         <div class="controls-row">
             <div class="input-group" style="flex:1;">
                 <label>Event URL / Ticker</label>
-                <input type="text" id="futures-url" placeholder="https://polymarket.com/event/... or KALSHI:KXCS2..." style="width:100%;">
+                <input type="text" id="futures-url" placeholder="kalshi, https://polymarket.com/event/..., or KALSHI:event_ticker" style="width:100%;">
             </div>
             <button class="btn btn-compute" onclick="futuresFetchEvent()" style="margin-top:18px; padding:10px 20px;">
                 Fetch Event
@@ -2045,6 +2161,8 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
         </div>
 
         <div id="futures-event-title" style="display:none; margin:10px 0; font-size:14px; color:#4fc3f7; font-weight:600;"></div>
+
+        <div id="futures-event-list" style="display:none; margin-top:16px;"></div>
 
         <div id="futures-loading" style="display:none; text-align:center; padding:20px; color:#4fc3f7;">
             <div class="spinner"></div> Fetching event markets...
@@ -2100,6 +2218,11 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
             </option>
             {% endfor %}
         </select>
+        <select id="best-of-select" onchange="onBestOfChange()" style="padding:6px 10px;font-size:13px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+            <option value="3" selected>BO3</option>
+            <option value="1">BO1</option>
+            <option value="5">BO5</option>
+        </select>
         <div id="pregame-chip" class="pregame-chip" style="display:none;">
             Pregame: <span id="pg-prob"></span>
         </div>
@@ -2119,6 +2242,14 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
             <div class="map-slot" data-map="3" onclick="cycleMap(3)">
                 <div class="map-num">Map 3</div>
                 <div class="map-result" id="map3-result">&mdash;</div>
+            </div>
+            <div class="map-slot" data-map="4" onclick="cycleMap(4)" style="display:none;">
+                <div class="map-num">Map 4</div>
+                <div class="map-result" id="map4-result">&mdash;</div>
+            </div>
+            <div class="map-slot" data-map="5" onclick="cycleMap(5)" style="display:none;">
+                <div class="map-num">Map 5</div>
+                <div class="map-result" id="map5-result">&mdash;</div>
             </div>
         </div>
 
@@ -2145,6 +2276,36 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
             <span class="round-val" id="away-rounds">0</span>
             <button class="round-adj" onclick="adjRounds('away',1)">+</button>
             <span class="round-team-label" id="round-away-label">AWAY</span>
+        </div>
+
+        <div class="side-section" style="display:flex; align-items:center; gap:12px; margin:8px 0; flex-wrap:wrap;">
+            <span style="font-size:12px; color:#888;">CT:</span>
+            <select id="ct-team-select" onchange="computeFair();ouComputeFair()" style="padding:4px 8px;font-size:12px;background:#1a1a2e;color:#4fc3f7;border:1px solid #333;border-radius:4px;">
+                <option value="home">HOME</option>
+                <option value="away">AWAY</option>
+            </select>
+            <span style="font-size:12px; color:#888;">CT%</span>
+            <input type="number" id="ct-win-pct" placeholder="—" min="1" max="99" style="width:50px;padding:4px;font-size:12px;background:#1a1a2e;color:#4fc3f7;border:1px solid #333;border-radius:4px;text-align:center;" title="CT round win % (leave blank for model default)" onchange="computeFair();ouComputeFair()">
+            <span style="font-size:12px; color:#888;">T%</span>
+            <input type="number" id="t-win-pct" placeholder="—" min="1" max="99" style="width:50px;padding:4px;font-size:12px;background:#ef9a9a;border:1px solid #333;border-radius:4px;text-align:center;" title="T round win % (leave blank for model default)" onchange="computeFair();ouComputeFair()">
+            <span style="font-size:11px; color:#555;" id="half-label"></span>
+        </div>
+
+        <div class="buy-section" style="display:flex; align-items:center; gap:10px; margin:4px 0; flex-wrap:wrap;">
+            <span style="font-size:12px; color:#888;" id="home-buy-label">HOME:</span>
+            <select id="home-buy" onchange="computeFair();ouComputeFair()" style="padding:4px 6px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+                <option value="">auto</option>
+                <option value="full">Full</option>
+                <option value="force">Force</option>
+                <option value="eco">Eco</option>
+            </select>
+            <span style="font-size:12px; color:#888;" id="away-buy-label">AWAY:</span>
+            <select id="away-buy" onchange="computeFair();ouComputeFair()" style="padding:4px 6px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+                <option value="">auto</option>
+                <option value="full">Full</option>
+                <option value="force">Force</option>
+                <option value="eco">Eco</option>
+            </select>
         </div>
 
         <div class="sb-section" id="sb-section" style="display:none;">
@@ -2349,9 +2510,68 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
     </div>
     </div>
 
+    <div id="tab-forfeit" style="display:none;">
+        <h2>Forfeit Iceberg</h2>
+        <p style="color:#aaa; font-size:13px; margin-bottom:14px;">
+            Accumulate a position with small randomized IOC orders at a set interval.
+        </p>
+        <div id="ff-match-content" style="display:none;">
+            <div class="controls-row">
+                <div class="input-group">
+                    <label>Market</label>
+                    <select id="ff-market-type" onchange="ffPopulateTeams()" style="width:160px; padding:6px 8px; background:#1a1a2e; color:#e0e0e0; border:1px solid #333; border-radius:4px;">
+                        <option value="moneyline">Moneyline</option>
+                        <option value="totalmaps">Total Maps</option>
+                    </select>
+                </div>
+                <div class="input-group">
+                    <label>Side</label>
+                    <select id="ff-team" style="width:220px; padding:6px 8px; background:#1a1a2e; color:#e0e0e0; border:1px solid #333; border-radius:4px;"></select>
+                </div>
+                <div class="input-group">
+                    <label>Max Price (c)</label>
+                    <input type="number" id="ff-price" value="97" min="1" max="99">
+                </div>
+                <div class="input-group">
+                    <label>Delay (s)</label>
+                    <input type="number" id="ff-delay" value="30" min="1" max="300">
+                </div>
+            </div>
+
+            <div class="btn-row">
+                <button class="btn btn-primary" onclick="ffStart()" id="ff-start-btn">Start Iceberg</button>
+                <button class="btn btn-danger" onclick="ffStop()" id="ff-stop-btn" style="display:none;">Stop</button>
+            </div>
+
+            <div class="kbd-help">
+                <span id="ff-status"></span>
+            </div>
+
+            <div id="ff-stats" class="results" style="margin-top:12px; display:none;">
+                <div class="market-info">
+                    <span>Total Filled: <b><span id="ff-filled-count">0</span></b></span>
+                    <span>Avg Price: <b><span id="ff-avg-price">&mdash;</span></b></span>
+                    <span>Total Cost: <b><span id="ff-total-cost">$0.00</span></b></span>
+                    <span>Orders Sent: <b><span id="ff-orders-sent">0</span></b></span>
+                </div>
+            </div>
+
+            <div id="ff-log" style="margin-top:12px; max-height:300px; overflow-y:auto; font-family:'SF Mono','Menlo',monospace; font-size:12px; color:#aaa;"></div>
+
+            <div id="ff-orderbook-section" style="display:none; margin-top:12px;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h2>Live Orderbook</h2>
+                    <span style="font-size:11px; color:#666;">Auto-refreshes 3s &bull;
+                        <span id="ff-ob-last-update"></span></span>
+                </div>
+                <div id="ff-orderbook-content"></div>
+            </div>
+        </div>
+    </div>
+
 <script>
 let currentGame = null;
-let mapResults = [0, 0, 0];
+let mapResults = [0, 0, 0, 0, 0];
 let homeRounds = 0, awayRounds = 0;
 let homeFair = 50;
 let obInterval = null;
@@ -2366,6 +2586,14 @@ let ouObInterval = null;
 let ouAutoRepricing = false;
 let ouLastPostedFair = null;
 let ouRepriceInFlight = false;
+
+// Forfeit iceberg state
+let ffActive = false;
+let ffTimeout = null;
+let ffObInterval = null;
+let ffTotalFilled = 0;
+let ffTotalCost = 0;
+let ffOrdersSent = 0;
 
 function onGameSelect() {
     const sel = document.getElementById('game-select');
@@ -2386,16 +2614,26 @@ function onGameSelect() {
         tickers: JSON.parse(opt.dataset.tickers || '[]'),
         ouTickers: JSON.parse(opt.dataset.ouTickers || '[]'),
     };
-    mapResults = [0, 0, 0];
+    mapResults = [0, 0, 0, 0, 0];
     homeRounds = 0;
     awayRounds = 0;
     document.getElementById('home-rounds').textContent = '0';
     document.getElementById('away-rounds').textContent = '0';
+    onBestOfChange();
 
     document.getElementById('home-label').textContent = home;
     document.getElementById('away-label').textContent = away;
     document.getElementById('round-home-label').textContent = home;
     document.getElementById('round-away-label').textContent = away;
+    const ctSel = document.getElementById('ct-team-select');
+    ctSel.innerHTML = '<option value="home">'+home+'</option><option value="away">'+away+'</option>';
+    document.getElementById('ct-win-pct').value = '';
+    document.getElementById('t-win-pct').value = '';
+    document.getElementById('half-label').textContent = '';
+    document.getElementById('home-buy-label').textContent = home + ':';
+    document.getElementById('away-buy-label').textContent = away + ':';
+    document.getElementById('home-buy').value = '';
+    document.getElementById('away-buy').value = '';
     document.getElementById('match-section').style.display = 'block';
     document.getElementById('pregame-chip').style.display = 'inline-block';
     document.getElementById('pg-prob').textContent =
@@ -2403,6 +2641,7 @@ function onGameSelect() {
 
     populateTeamDropdowns();
     populateOUDropdowns();
+    ffPopulateTeams();
 
     const hasTickers = currentGame.tickers.length > 0;
     document.getElementById('orderbook-section').style.display = hasTickers ? 'block' : 'none';
@@ -2417,6 +2656,11 @@ function onGameSelect() {
     document.getElementById('ou-jump-section').style.display = hasOUTickers ? 'block' : 'none';
     document.getElementById('ou-match-content').style.display = 'block';
     if (hasOUTickers) ouStartOB(); else ouStopOB();
+
+    const hasAnyFF = hasTickers || hasOUTickers;
+    document.getElementById('ff-match-content').style.display = hasAnyFF ? 'block' : 'none';
+    document.getElementById('ff-orderbook-section').style.display = hasAnyFF ? 'block' : 'none';
+    if (hasAnyFF && activeTab === 'forfeit') ffStartOB();
 
     updateDisplay();
     computeFair();
@@ -2466,6 +2710,23 @@ function populateOUDropdowns() {
     }
 }
 
+function onBestOfChange() {
+    const bo = parseInt(document.getElementById('best-of-select').value) || 3;
+    const maxMaps = bo;
+    for (let i = 0; i < 5; i++) {
+        const slot = document.querySelector('[data-map="'+(i+1)+'"]');
+        if (slot) slot.style.display = i < maxMaps ? '' : 'none';
+    }
+    mapResults = [0, 0, 0, 0, 0];
+    homeRounds = 0;
+    awayRounds = 0;
+    document.getElementById('home-rounds').textContent = '0';
+    document.getElementById('away-rounds').textContent = '0';
+    updateDisplay();
+    computeFair();
+    ouComputeFair();
+}
+
 function cycleMap(n) {
     const idx = n - 1;
     mapResults[idx] = mapResults[idx] === 0 ? 1 : mapResults[idx] === 1 ? -1 : 0;
@@ -2489,10 +2750,12 @@ function adjRounds(who, delta) {
 
 function updateDisplay() {
     if (!currentGame) return;
+    const bo = parseInt(document.getElementById('best-of-select').value) || 3;
     let homeMaps = 0, awayMaps = 0;
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < bo; i++) {
         const slot = document.querySelector('[data-map="'+(i+1)+'"]');
         const result = document.getElementById('map'+(i+1)+'-result');
+        if (!slot) continue;
         slot.classList.remove('home-won', 'away-won');
         if (mapResults[i] === 1) {
             slot.classList.add('home-won');
@@ -2515,8 +2778,9 @@ function updateDisplay() {
 }
 
 function getState() {
+    const bo = parseInt(document.getElementById('best-of-select').value) || 3;
     let homeMaps = 0, awayMaps = 0, mapsPlayed = 0;
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < bo; i++) {
         if (mapResults[i] !== 0) {
             mapsPlayed = i + 1;
             if (mapResults[i] === 1) homeMaps++;
@@ -2525,6 +2789,15 @@ function getState() {
     }
     const ov = document.getElementById('override-prob').value;
     const homeProb = ov ? parseInt(ov) / 100 : currentGame.homeProb;
+    const bestOf = parseInt(document.getElementById('best-of-select').value) || 3;
+    const ctTeam = document.getElementById('ct-team-select').value;
+    const ctPct = document.getElementById('ct-win-pct').value;
+    const tPct = document.getElementById('t-win-pct').value;
+    const totalRounds = homeRounds + awayRounds;
+    const secondHalf = totalRounds >= 12;
+    const homeIsCt = secondHalf ? (ctTeam !== 'home') : (ctTeam === 'home');
+    document.getElementById('half-label').textContent =
+        totalRounds >= 12 ? '2nd half (sides flipped)' : totalRounds > 0 ? '1st half' : '';
     return {
         home: currentGame.home,
         away: currentGame.away,
@@ -2537,6 +2810,12 @@ function getState() {
         contracts: parseInt(document.getElementById('contracts').value),
         spread_cents: parseInt(document.getElementById('spread-cents').value),
         tickers: currentGame.tickers,
+        best_of: bestOf,
+        home_is_ct: homeIsCt,
+        ct_win_pct: ctPct ? parseInt(ctPct) : null,
+        t_win_pct: tPct ? parseInt(tPct) : null,
+        home_buy: document.getElementById('home-buy').value || null,
+        away_buy: document.getElementById('away-buy').value || null,
     };
 }
 
@@ -3195,6 +3474,146 @@ async function ouFetchOB() {
     } catch(e) {}
 }
 
+// ── Forfeit Iceberg ──────────────────────────────────────
+function ffPopulateTeams() {
+    const el = document.getElementById('ff-team');
+    el.innerHTML = '';
+    if (!currentGame) return;
+    const mtype = document.getElementById('ff-market-type').value;
+    const tickers = mtype === 'totalmaps' ? currentGame.ouTickers : currentGame.tickers;
+    if (!tickers || !tickers.length) return;
+    const seen = new Set();
+    for (const t of tickers) {
+        if (!seen.has(t.yes_team)) {
+            seen.add(t.yes_team);
+            const o = document.createElement('option');
+            o.value = JSON.stringify({ticker: t.ticker, side: 'yes'});
+            o.textContent = t.yes_team;
+            el.appendChild(o);
+        }
+        if (!seen.has(t.no_team)) {
+            seen.add(t.no_team);
+            const o = document.createElement('option');
+            o.value = JSON.stringify({ticker: t.ticker, side: 'no'});
+            o.textContent = t.no_team;
+            el.appendChild(o);
+        }
+    }
+    if (mtype === 'totalmaps') {
+        el.value = JSON.stringify({ticker: tickers[0].ticker, side: 'no'});
+    }
+}
+
+function ffStartOB() { ffStopOB(); ffFetchOB(); ffObInterval = setInterval(ffFetchOB, 3000); }
+function ffStopOB() { if (ffObInterval) { clearInterval(ffObInterval); ffObInterval = null; } }
+
+async function ffFetchOB() {
+    if (!currentGame) return;
+    const mtype = document.getElementById('ff-market-type').value;
+    const tickers = mtype === 'totalmaps' ? currentGame.ouTickers : currentGame.tickers;
+    if (!tickers || !tickers.length) return;
+    try {
+        const resp = await fetch('/api/orderbook', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({tickers}),
+        });
+        const data = await resp.json();
+        renderOB(data.books, 'ff-orderbook-content');
+        document.getElementById('ff-ob-last-update').textContent =
+            new Date().toLocaleTimeString();
+    } catch(e) {}
+}
+
+function ffLog(msg) {
+    const el = document.getElementById('ff-log');
+    const ts = new Date().toLocaleTimeString();
+    el.innerHTML = '<div style="margin-bottom:2px;"><span style="color:#666;">' +
+        ts + '</span> ' + msg + '</div>' + el.innerHTML;
+}
+
+function ffUpdateStats() {
+    document.getElementById('ff-filled-count').textContent = ffTotalFilled;
+    const avg = ffTotalFilled > 0 ? (ffTotalCost / ffTotalFilled).toFixed(1) : '—';
+    document.getElementById('ff-avg-price').textContent = avg + (ffTotalFilled > 0 ? 'c' : '');
+    document.getElementById('ff-total-cost').textContent = '$' + (ffTotalCost / 100).toFixed(2);
+    document.getElementById('ff-orders-sent').textContent = ffOrdersSent;
+}
+
+function ffUpdateStatus() {
+    const el = document.getElementById('ff-status');
+    if (ffActive) {
+        const delay = parseInt(document.getElementById('ff-delay').value) || 30;
+        el.textContent = 'ICEBERG ACTIVE — every ' + delay + 's';
+        el.style.display = 'inline-block';
+        el.style.background = '#4caf50';
+        el.style.color = '#fff';
+        el.style.padding = '2px 8px';
+        el.style.borderRadius = '4px';
+        el.style.fontSize = '11px';
+        el.style.fontWeight = '700';
+    } else {
+        el.textContent = '';
+        el.style.display = 'none';
+    }
+}
+
+async function ffFireOrder() {
+    if (!ffActive || !currentGame) return;
+    const sel = document.getElementById('ff-team');
+    if (!sel.value) return;
+    const {ticker, side} = JSON.parse(sel.value);
+    const maxPrice = parseInt(document.getElementById('ff-price').value) || 97;
+    const count = Math.floor(Math.random() * 5) + 1;
+
+    try {
+        const resp = await fetch('/api/forfeit/ioc', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ticker, side, max_price: maxPrice, count}),
+        });
+        const data = await resp.json();
+        ffOrdersSent++;
+        if (data.filled > 0) {
+            ffTotalFilled += data.filled;
+            ffTotalCost += data.filled * data.fill_price;
+            ffLog('<span style="color:#4caf50;">FILLED ' + data.filled + '/' +
+                count + ' @ ' + data.fill_price + 'c</span>');
+        } else if (data.no_ask) {
+            ffLog('<span style="color:#666;">No ask available</span>');
+        } else {
+            ffLog('<span style="color:#ff9800;">NOT FILLED ' + count +
+                ' @ ' + data.tried_price + 'c (ask ' + (data.best_ask || '?') + 'c)</span>');
+        }
+        ffUpdateStats();
+    } catch(e) {
+        ffLog('<span style="color:#ef5350;">ERROR: ' + e.message + '</span>');
+    }
+
+    if (ffActive) {
+        const delay = parseInt(document.getElementById('ff-delay').value) || 30;
+        ffTimeout = setTimeout(ffFireOrder, delay * 1000);
+    }
+}
+
+function ffStart() {
+    if (!currentGame) return;
+    ffActive = true;
+    ffUpdateStatus();
+    document.getElementById('ff-start-btn').style.display = 'none';
+    document.getElementById('ff-stop-btn').style.display = '';
+    document.getElementById('ff-stats').style.display = 'block';
+    ffLog('<b>Iceberg started</b>');
+    ffFireOrder();
+}
+
+function ffStop() {
+    ffActive = false;
+    if (ffTimeout) { clearTimeout(ffTimeout); ffTimeout = null; }
+    ffUpdateStatus();
+    document.getElementById('ff-start-btn').style.display = '';
+    document.getElementById('ff-stop-btn').style.display = 'none';
+    ffLog('<b>Iceberg stopped</b>');
+}
+
 // ── HLTV Scoreboard ───────────────────────────────────────
 let sbInterval = null;
 
@@ -3399,7 +3818,8 @@ function switchTab(tab) {
     document.getElementById('tab-predict').style.display = tab === 'predict' ? '' : 'none';
     document.getElementById('tab-bracket').style.display = tab === 'bracket' ? '' : 'none';
     document.getElementById('tab-futures').style.display = tab === 'futures' ? '' : 'none';
-    const showMatch = (tab === 'trade' || tab === 'ou-trade');
+    document.getElementById('tab-forfeit').style.display = tab === 'forfeit' ? '' : 'none';
+    const showMatch = (tab === 'trade' || tab === 'ou-trade' || tab === 'forfeit');
     document.getElementById('match-state').style.display = showMatch ? 'block' : 'none';
     document.querySelectorAll('.tab-bar .tab').forEach(b => b.classList.remove('active'));
     event.target.classList.add('active');
@@ -3422,15 +3842,21 @@ function switchTab(tab) {
             });
         }
     }
+    if (tab === 'forfeit' && currentGame && (currentGame.tickers.length || currentGame.ouTickers.length)) {
+        ffStartOB();
+    } else {
+        ffStopOB();
+    }
 }
 
 function runPredict() {
     const a = document.getElementById('pred-team-a').value.trim();
     const b = document.getElementById('pred-team-b').value.trim();
+    const format = document.getElementById('pred-format').value;
     if (!a || !b) return;
     fetch('/api/predict', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({team_a: a, team_b: b})
+        body: JSON.stringify({team_a: a, team_b: b, format: format})
     }).then(r => r.json()).then(data => {
         if (data.error) { alert(data.error); return; }
         document.getElementById('pred-a-name').textContent = data.team_a;
@@ -3441,15 +3867,20 @@ function runPredict() {
         document.getElementById('pred-b-ml').textContent = data.ml_b;
         document.getElementById('pred-a-games').textContent = data.team_a + ': ' + data.games_a + ' games';
         document.getElementById('pred-b-games').textContent = data.team_b + ': ' + data.games_b + ' games';
+        const ouRow = document.getElementById('pred-ou-row');
         if (data.over_under) {
             const ou = data.over_under;
-            document.getElementById('pred-ou-row').innerHTML =
-                '<div class="ou-chip"><div class="ou-label">Over 2.5</div>' +
+            ouRow.innerHTML =
+                '<div class="ou-chip"><div class="ou-label">Over ' + ou.line + '</div>' +
                 '<div class="ou-pct">' + (ou.over_prob * 100).toFixed(1) + '%</div>' +
                 '<div class="ou-fair">' + ou.over_fair + 'c</div></div>' +
-                '<div class="ou-chip"><div class="ou-label">Under 2.5</div>' +
+                '<div class="ou-chip"><div class="ou-label">Under ' + ou.line + '</div>' +
                 '<div class="ou-pct">' + (ou.under_prob * 100).toFixed(1) + '%</div>' +
                 '<div class="ou-fair">' + ou.under_fair + 'c</div></div>';
+            ouRow.style.display = '';
+        } else {
+            ouRow.innerHTML = '';
+            ouRow.style.display = 'none';
         }
         document.getElementById('pred-result').style.display = '';
     });
@@ -3460,6 +3891,17 @@ let BRK_ALL_TEAMS = [];
 let brkRounds = [];
 let swissMode = false;
 let swissStages = [];
+let brkActiveName = null;
+
+function brkAutosave() {
+    if (!brkActiveName) return;
+    const saves = JSON.parse(localStorage.getItem('cs2_brackets') || '{}');
+    saves[brkActiveName] = {
+        swissStages: JSON.parse(JSON.stringify(swissStages)),
+        brkRounds: JSON.parse(JSON.stringify(brkRounds)),
+    };
+    localStorage.setItem('cs2_brackets', JSON.stringify(saves));
+}
 
 function brkClear() {
     brkRounds = [];
@@ -3474,6 +3916,7 @@ function brkClear() {
 function brkAddRound() {
     brkRounds.push({label: 'Round ' + (brkRounds.length + 1), games: []});
     brkRender();
+    brkAutosave();
 }
 
 function brkRemoveRound(ri) {
@@ -3490,11 +3933,12 @@ function brkRemoveRound(ri) {
         }
     }
     brkRender();
+    brkAutosave();
 }
 
 function brkRenameRound(ri) {
     const name = prompt('Round name:', brkRounds[ri].label);
-    if (name !== null && name.trim()) { brkRounds[ri].label = name.trim(); brkRender(); }
+    if (name !== null && name.trim()) { brkRounds[ri].label = name.trim(); brkRender(); brkAutosave(); }
 }
 
 function brkAddGame(ri) {
@@ -3504,6 +3948,7 @@ function brkAddGame(ri) {
         bo: 3,
     });
     brkRender();
+    brkAutosave();
 }
 
 function brkRemoveGame(ri, gi) {
@@ -3520,6 +3965,7 @@ function brkRemoveGame(ri, gi) {
         }
     }
     brkRender();
+    brkAutosave();
 }
 
 function brkSlotChange(ri, gi, sk, val) {
@@ -3534,6 +3980,7 @@ function brkSlotChange(ri, gi, sk, val) {
     } else {
         brkRounds[ri].games[gi][sk] = {type:'team', team: val};
     }
+    brkAutosave();
 }
 
 function brkSlotVal(slot) {
@@ -3572,7 +4019,7 @@ function brkRender() {
             html += '<div class="brk-game">';
             const bo = game.bo || 3;
             html += '<div class="brk-game-num">G'+(gi+1);
-            html += ' <select onchange="brkRounds['+ri+'].games['+gi+'].bo=parseInt(this.value)" style="background:#111;color:#4fc3f7;border:1px solid #333;border-radius:3px;font-size:9px;padding:0 2px;">';
+            html += ' <select onchange="brkRounds['+ri+'].games['+gi+'].bo=parseInt(this.value);brkAutosave()" style="background:#111;color:#4fc3f7;border:1px solid #333;border-radius:3px;font-size:9px;padding:0 2px;">';
             html += '<option value="1"'+(bo===1?' selected':'')+'>BO1</option>';
             html += '<option value="3"'+(bo===3?' selected':'')+'>BO3</option>';
             html += '<option value="5"'+(bo===5?' selected':'')+'>BO5</option>';
@@ -3707,13 +4154,14 @@ function brkPreset(key) {
     } else if (key === 'swiss') {
         swissMode = true;
         brkRounds = [];
-        swissStages = [{label:'Stage 1', winsToAdv:3, lossesToElim:3, slots:[]}];
+        swissStages = [{label:'Stage 1', winsToAdv:3, lossesToElim:3, slots:[], midStage:false, matchBo:1, deciderBo:3}];
         const ct = Math.min(16, T.length);
-        for (let i = 0; i < ct; i++) swissStages[0].slots.push({type:'team', team:T[i]});
+        for (let i = 0; i < ct; i++) swissStages[0].slots.push({type:'team', team:T[i], wins:0, losses:0});
         document.getElementById('brk-bracket-area').style.display = 'none';
         document.getElementById('swiss-panel').style.display = '';
         swissRender();
         document.getElementById('bracket-results').innerHTML = '';
+        brkAutosave();
         return;
     }
     if (hadSwiss && key !== 'swiss') {
@@ -3734,6 +4182,7 @@ function brkPreset(key) {
         document.getElementById('brk-bracket-area').style.display = '';
         brkRender();
         document.getElementById('bracket-results').innerHTML = '';
+        brkAutosave();
         return;
     }
     swissMode = false;
@@ -3742,6 +4191,7 @@ function brkPreset(key) {
     document.getElementById('brk-bracket-area').style.display = '';
     brkRender();
     document.getElementById('bracket-results').innerHTML = '';
+    brkAutosave();
 }
 
 async function brkSimulate() {
@@ -3756,7 +4206,10 @@ async function brkSimulate() {
                 label: st.label,
                 wins_to_advance: st.winsToAdv,
                 losses_to_eliminate: st.lossesToElim,
-                slots: st.slots.map(s => s.type === 'advance' ? {type:'advance', stage:s.stage} : {type:'team', team:s.team}),
+                mid_stage: st.midStage || false,
+                match_bo: st.matchBo || 1,
+                decider_bo: st.deciderBo || 3,
+                slots: st.slots.map(s => s.type === 'advance' ? {type:'advance', stage:s.stage} : {type:'team', team:s.team, wins:s.wins||0, losses:s.losses||0}),
             })),
             sims,
         };
@@ -3900,9 +4353,9 @@ function brkRenderResults(data) {
 
 function swissAddStage() {
     const idx = swissStages.length;
-    swissStages.push({label:'Stage '+(idx+1), winsToAdv:3, lossesToElim:3, slots:[]});
+    swissStages.push({label:'Stage '+(idx+1), winsToAdv:3, lossesToElim:3, slots:[], midStage:false, matchBo:1, deciderBo:3});
     const ct = Math.min(16, BRK_ALL_TEAMS.length);
-    for (let i = 0; i < ct; i++) swissStages[idx].slots.push({type:'team', team:BRK_ALL_TEAMS[i]});
+    for (let i = 0; i < ct; i++) swissStages[idx].slots.push({type:'team', team:BRK_ALL_TEAMS[i], wins:0, losses:0});
     swissRender();
 }
 
@@ -3926,7 +4379,7 @@ function swissRenameStage(si) {
 
 function swissSetTeamCount(si, count) {
     const st = swissStages[si];
-    while (st.slots.length < count) st.slots.push({type:'team', team:BRK_ALL_TEAMS[0]});
+    while (st.slots.length < count) st.slots.push({type:'team', team:BRK_ALL_TEAMS[0], wins:0, losses:0});
     while (st.slots.length > count) st.slots.pop();
     swissRender();
 }
@@ -3936,13 +4389,26 @@ function swissSlotChange(si, slotIdx, val) {
         const fromStage = parseInt(val.split(':')[1]);
         swissStages[si].slots[slotIdx] = {type:'advance', stage: fromStage};
     } else {
-        swissStages[si].slots[slotIdx] = {type:'team', team: val};
+        swissStages[si].slots[slotIdx] = {type:'team', team: val, wins:0, losses:0};
     }
     swissRender();
 }
 
 function swissSlotToTeam(si, slotIdx) {
-    swissStages[si].slots[slotIdx] = {type:'team', team: BRK_ALL_TEAMS[0]};
+    swissStages[si].slots[slotIdx] = {type:'team', team: BRK_ALL_TEAMS[0], wins:0, losses:0};
+    swissRender();
+}
+
+function swissSetRecord(si, slotIdx, field, val) {
+    swissStages[si].slots[slotIdx][field] = parseInt(val) || 0;
+    brkAutosave();
+}
+
+function swissToggleMidStage(si) {
+    swissStages[si].midStage = !swissStages[si].midStage;
+    if (!swissStages[si].midStage) {
+        for (const s of swissStages[si].slots) { s.wins = 0; s.losses = 0; }
+    }
     swissRender();
 }
 
@@ -3976,8 +4442,19 @@ function swissRender() {
             html += '<option value="'+c+'"'+(st.slots.length===c?' selected':'')+'>'+c+'</option>';
         }
         html += '</select></div>';
-        html += '<div><label>Wins to Advance</label><input type="number" min="1" max="5" value="'+st.winsToAdv+'" onchange="swissStages['+si+'].winsToAdv=parseInt(this.value)" style="width:50px;"></div>';
-        html += '<div><label>Losses to Elim</label><input type="number" min="1" max="5" value="'+st.lossesToElim+'" onchange="swissStages['+si+'].lossesToElim=parseInt(this.value)" style="width:50px;"></div>';
+        html += '<div><label>Wins to Advance</label><input type="number" min="1" max="5" value="'+st.winsToAdv+'" onchange="swissStages['+si+'].winsToAdv=parseInt(this.value);brkAutosave()" style="width:50px;"></div>';
+        html += '<div><label>Losses to Elim</label><input type="number" min="1" max="5" value="'+st.lossesToElim+'" onchange="swissStages['+si+'].lossesToElim=parseInt(this.value);brkAutosave()" style="width:50px;"></div>';
+        const mBo = st.matchBo || 1;
+        const dBo = st.deciderBo || 3;
+        html += '<div><label>Match BO</label><select onchange="swissStages['+si+'].matchBo=parseInt(this.value);brkAutosave()">';
+        html += '<option value="1"'+(mBo===1?' selected':'')+'>BO1</option>';
+        html += '<option value="3"'+(mBo===3?' selected':'')+'>BO3</option>';
+        html += '</select></div>';
+        html += '<div><label>Decider BO</label><select onchange="swissStages['+si+'].deciderBo=parseInt(this.value);brkAutosave()">';
+        html += '<option value="1"'+(dBo===1?' selected':'')+'>BO1</option>';
+        html += '<option value="3"'+(dBo===3?' selected':'')+'>BO3</option>';
+        html += '</select></div>';
+        html += '<div style="display:flex;align-items:flex-end;"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" '+(st.midStage?'checked':'')+' onchange="swissToggleMidStage('+si+')" style="accent-color:#4fc3f7;"> Mid-Stage</label></div>';
         html += '</div>';
 
         html += '<div class="swiss-team-grid">';
@@ -3990,7 +4467,7 @@ function swissRender() {
                 html += '<div class="adv-tag"><span>Adv. from '+srcLabel+'</span>';
                 html += '<button class="remove-adv" onclick="swissSlotToTeam('+si+','+i+')" title="Change to team">&times;</button></div>';
             } else {
-                html += '<select onchange="swissSlotChange('+si+','+i+',this.value)">';
+                html += '<select onchange="swissSlotChange('+si+','+i+',this.value)" style="'+(st.midStage?'flex:1;':'flex:1;')+'">';
                 for (const t of BRK_ALL_TEAMS) {
                     html += '<option value="'+t+'"'+(slot.team===t?' selected':'')+'>'+t+'</option>';
                 }
@@ -4001,6 +4478,13 @@ function swissRender() {
                     }
                 }
                 html += '</select>';
+                if (st.midStage) {
+                    const maxW = st.winsToAdv - 1;
+                    const maxL = st.lossesToElim - 1;
+                    html += '<input type="number" min="0" max="'+st.winsToAdv+'" value="'+(slot.wins||0)+'" onchange="swissSetRecord('+si+','+i+',\\'wins\\',this.value)" title="Wins" style="width:36px;text-align:center;background:#1a2e1a;color:#81c784;border:1px solid #2e7d32;border-radius:4px;font-size:11px;padding:3px;">';
+                    html += '<span style="color:#555;font-size:11px;">-</span>';
+                    html += '<input type="number" min="0" max="'+st.lossesToElim+'" value="'+(slot.losses||0)+'" onchange="swissSetRecord('+si+','+i+',\\'losses\\',this.value)" title="Losses" style="width:36px;text-align:center;background:#2e1a1a;color:#ef5350;border:1px solid #7d2e2e;border-radius:4px;font-size:11px;padding:3px;">';
+                }
             }
             html += '</div>';
         }
@@ -4020,6 +4504,7 @@ function swissRender() {
         html += '</div>';
     }
     area.innerHTML = html;
+    brkAutosave();
 }
 
 async function swissSimulate() {
@@ -4030,7 +4515,10 @@ async function swissSimulate() {
         label: st.label,
         wins_to_advance: st.winsToAdv,
         losses_to_eliminate: st.lossesToElim,
-        slots: st.slots.map(s => s.type === 'advance' ? {type:'advance', stage:s.stage} : {type:'team', team:s.team}),
+        mid_stage: st.midStage || false,
+        match_bo: st.matchBo || 1,
+        decider_bo: st.deciderBo || 3,
+        slots: st.slots.map(s => s.type === 'advance' ? {type:'advance', stage:s.stage} : {type:'team', team:s.team, wins:s.wins||0, losses:s.losses||0}),
     }));
 
     document.getElementById('bracket-loading').style.display = 'block';
@@ -4118,10 +4606,11 @@ function swissRenderResults(data) {
 // ── Save / Load Brackets ─────────────────────────────────────
 
 function brkSave() {
-    const name = prompt('Name this bracket:');
+    const name = prompt('Name this bracket:', brkActiveName || '');
     if (!name || !name.trim()) return;
+    brkActiveName = name.trim();
     const saves = JSON.parse(localStorage.getItem('cs2_brackets') || '{}');
-    saves[name.trim()] = {
+    saves[brkActiveName] = {
         swissStages: JSON.parse(JSON.stringify(swissStages)),
         brkRounds: JSON.parse(JSON.stringify(brkRounds)),
     };
@@ -4133,6 +4622,7 @@ function brkLoad(name) {
     if (!name) return;
     const saves = JSON.parse(localStorage.getItem('cs2_brackets') || '{}');
     if (!saves[name]) return;
+    brkActiveName = name;
     const data = saves[name];
     swissStages = data.swissStages || [];
     brkRounds = data.brkRounds || [];
@@ -4180,10 +4670,53 @@ async function futuresFetchEvent() {
     document.getElementById('futures-loading').style.display = '';
     document.getElementById('futures-table-container').style.display = 'none';
     document.getElementById('futures-event-title').style.display = 'none';
+    document.getElementById('futures-event-list').style.display = 'none';
     try {
         const resp = await fetch('/api/futures/fetch_event', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({url}),
+        });
+        const data = await resp.json();
+        if (data.error) { alert(data.error); return; }
+        if (data.mode === 'event_list') {
+            futuresRenderEventList(data.events);
+        } else {
+            futuresMarkets = data.markets;
+            futuresMarkets.forEach(m => { m._checked = true; m._fair = null; });
+            if (data.event_title) {
+                const el = document.getElementById('futures-event-title');
+                el.textContent = data.event_title;
+                el.style.display = '';
+            }
+            futuresRenderTable();
+        }
+    } catch(e) {
+        alert('Error: ' + e.message);
+    }
+    document.getElementById('futures-loading').style.display = 'none';
+}
+
+function futuresRenderEventList(events) {
+    const el = document.getElementById('futures-event-list');
+    let html = '<p style="color:#aaa;font-size:12px;margin-bottom:10px;">Select an event to load markets:</p>';
+    for (const ev of events) {
+        html += '<div class="futures-event-row" onclick="futuresLoadKalshiEvent(&quot;' + ev.event_ticker + '&quot;)" '
+              + 'style="padding:12px 16px;margin-bottom:6px;background:#1a1a2e;border:1px solid #333;border-radius:6px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;">'
+              + '<div><span style="color:#e0e0e0;font-weight:600;">'+ev.title+'</span>'
+              + '<span style="color:#555;font-size:11px;margin-left:10px;">'+ev.event_ticker+'</span></div>'
+              + '<span style="color:#4fc3f7;font-size:12px;">&rarr;</span></div>';
+    }
+    el.innerHTML = html;
+    el.style.display = '';
+}
+
+async function futuresLoadKalshiEvent(eventTicker) {
+    document.getElementById('futures-event-list').style.display = 'none';
+    document.getElementById('futures-loading').style.display = '';
+    try {
+        const resp = await fetch('/api/futures/fetch_event', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({url: 'KALSHI:' + eventTicker}),
         });
         const data = await resp.json();
         if (data.error) { alert(data.error); return; }
@@ -4467,12 +5000,31 @@ def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False
     spread_cents = data.get('spread_cents', SPREAD_CENTS)
     tickers = data.get('tickers', [])
 
+    best_of = data.get('best_of', 3)
+    home_is_ct = data.get('home_is_ct')
+    ct_win_pct = data.get('ct_win_pct')
+    t_win_pct = data.get('t_win_pct')
+    manual_home_buy = data.get('home_buy')
+    manual_away_buy = data.get('away_buy')
+
     map_p = series_to_map_prob(home_prob)
-    per_map = [map_p] * 3
+    neutral_map_p = map_p
+    ct_round_rate = ct_win_pct / 100.0 if ct_win_pct is not None else None
+
+    # CT/T win % = neutral side advantage (e.g. CT=53 means CT wins 53% of rounds even matchup)
+    # Combine with model skill: shift map_p by side offset (display/per_map only)
+    if ct_win_pct is not None and home_is_ct is not None:
+        side_offset = (ct_win_pct - 50) / 100.0 if home_is_ct else -(ct_win_pct - 50) / 100.0
+        map_p = max(0.01, min(0.99, map_p + side_offset))
+
+    per_map = [neutral_map_p] * best_of
     map_prob = map_p
-    if maps_played < 3 and (home_rounds > 0 or away_rounds > 0):
-        map_prob = live_round_win_prob(home_rounds, away_rounds, map_p)
-        per_map[maps_played] = map_prob
+    if maps_played < best_of:
+        per_map[maps_played] = map_p
+        if home_rounds > 0 or away_rounds > 0:
+            map_prob = live_round_win_prob(home_rounds, away_rounds, neutral_map_p,
+                                           home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+            per_map[maps_played] = map_prob
 
     # Economy adjustment from scoreboard
     econ_info = {}
@@ -4505,13 +5057,14 @@ def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False
                 print(f"[BOMB-DBG] Not planted. Elements: {bomb_debug[:3]}")
             elif bomb_planted:
                 print(f"[BOMB] PLANTED ({bomb_src}) | timer={timer_secs}s")
+            rh = sb_state.get('round_history', [])
             econ_map_p, econ_detail = economy_adjusted_map_prob(
-                ct_players, t_players, map_p, home_is_ct, home_rounds, away_rounds,
-                bomb_planted=bomb_planted, timer_seconds=timer_secs)
+                ct_players, t_players, neutral_map_p, home_is_ct, home_rounds, away_rounds,
+                bomb_planted=bomb_planted, timer_seconds=timer_secs,
+                round_history=rh, ct_round_rate=ct_round_rate)
 
             if econ_detail:
-                # Use economy-adjusted map prob directly
-                map_idx = maps_played if maps_played < 3 else 2
+                map_idx = maps_played if maps_played < best_of else best_of - 1
                 per_map[map_idx] = econ_map_p
                 map_prob = econ_map_p
                 econ_info = econ_detail
@@ -4525,15 +5078,53 @@ def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False
                       f"econ_map={econ_map_p:.3f} "
                       f"w={econ_detail['econ_weight']:.2f}{phase_tag}")
 
-    live_wp = live_bo3_win_prob(home_maps, away_maps, maps_played, per_map)
+    # Manual buy type override — apply when no HLTV scoreboard or override HLTV
+    if manual_home_buy and manual_away_buy and home_is_ct is not None:
+        ct_buy = manual_home_buy if home_is_ct else manual_away_buy
+        t_buy = manual_away_buy if home_is_ct else manual_home_buy
+        matchup_rate = BUY_MATCHUP_RATES.get((ct_buy, t_buy), 0.50)
+        skill_p = neutral_map_p if home_is_ct else (1 - neutral_map_p)
+        econ_weight = 0.55 + abs(matchup_rate - 0.50) * 1.2
+        econ_weight = min(econ_weight, 0.92)
+        ct_round_p = (1 - econ_weight) * skill_p + econ_weight * matchup_rate
+        home_round_p = ct_round_p if home_is_ct else (1 - ct_round_p)
+        p_map_if_win = live_round_win_prob(home_rounds + 1, away_rounds, neutral_map_p,
+                                            home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+        p_map_if_lose = live_round_win_prob(home_rounds, away_rounds + 1, neutral_map_p,
+                                             home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+        econ_map_p = home_round_p * p_map_if_win + (1 - home_round_p) * p_map_if_lose
+        map_idx = maps_played if maps_played < best_of else best_of - 1
+        per_map[map_idx] = econ_map_p
+        map_prob = econ_map_p
+        econ_info = {
+            'home_buy': manual_home_buy, 'away_buy': manual_away_buy,
+            'home_avg_money': 0, 'away_avg_money': 0,
+            'home_avg_power': 0, 'away_avg_power': 0,
+            'home_alive': 5, 'away_alive': 5,
+            'home_is_ct': home_is_ct, 'phase': 'manual',
+            'bomb_planted': False, 'bomb_status': 'none',
+            'timer_seconds': -1, 'econ_weight': round(econ_weight, 2),
+            'home_round_p': round(home_round_p, 4),
+            'econ_map_prob': round(econ_map_p, 4),
+        }
+        print(f"[MANUAL-ECON] {home} [{manual_home_buy.upper()}] vs "
+              f"{away} [{manual_away_buy.upper()}] | "
+              f"round_p={home_round_p:.3f} econ_map={econ_map_p:.3f}")
+
+    if best_of == 1:
+        live_wp = per_map[0]
+    elif best_of == 5:
+        live_wp = live_bo5_win_prob(home_maps, away_maps, maps_played, per_map)
+    else:
+        live_wp = live_bo3_win_prob(home_maps, away_maps, maps_played, per_map)
     home_fair = max(1, min(99, int(round(live_wp * 100))))
     away_fair = 100 - home_fair
 
-    print(f"[COMPUTE] {away} vs {home} | maps={home_maps}-{away_maps} "
+    print(f"[COMPUTE] {away} vs {home} | BO{best_of} maps={home_maps}-{away_maps} "
           f"rounds={home_rounds}-{away_rounds} | pregame={home_prob:.3f} "
           f"map={map_prob:.3f} live={live_wp:.3f} -> {home_fair}c")
 
-    alt = compute_alt_lines_bo3(home_maps, away_maps, maps_played, per_map)
+    alt = compute_alt_lines_bo3(home_maps, away_maps, maps_played, per_map) if best_of == 3 else {}
 
     result = {
         'home': home, 'away': away,
@@ -4599,9 +5190,14 @@ def _compute_and_post_ou(data, cancel_first=False, post_orders_flag=True, ioc=Fa
     ou_tickers = data.get('ou_tickers', [])
 
     map_p = series_to_map_prob(home_prob)
+    ct_win_pct_ou = data.get('ct_win_pct')
+    ct_round_rate_ou = ct_win_pct_ou / 100.0 if ct_win_pct_ou is not None else None
+    home_is_ct_ou = data.get('home_is_ct')
     per_map = [map_p] * 3
     if maps_played < 3 and (home_rounds > 0 or away_rounds > 0):
-        per_map[maps_played] = live_round_win_prob(home_rounds, away_rounds, map_p)
+        per_map[maps_played] = live_round_win_prob(home_rounds, away_rounds, map_p,
+                                                    home_is_ct=home_is_ct_ou,
+                                                    ct_round_rate=ct_round_rate_ou)
 
     sb_state = HLTV_SCRAPER.get_state() if HLTV_SCRAPER else None
     if sb_state and (sb_state.get('ct_players') or sb_state.get('t_players')):
@@ -4622,10 +5218,12 @@ def _compute_and_post_ou(data, cancel_first=False, post_orders_flag=True, ioc=Fa
         if home_is_ct is not None:
             bomb_planted = sb_state.get('bomb_planted', False)
             timer_secs = sb_state.get('timer_seconds', -1)
+            rh = sb_state.get('round_history', [])
             econ_map_p, econ_detail = economy_adjusted_map_prob(
                 sb_state.get('ct_players', []), sb_state.get('t_players', []),
                 map_p, home_is_ct, home_rounds, away_rounds,
-                bomb_planted=bomb_planted, timer_seconds=timer_secs)
+                bomb_planted=bomb_planted, timer_seconds=timer_secs,
+                round_history=rh, ct_round_rate=ct_round_rate_ou)
             if econ_detail:
                 map_idx = maps_played if maps_played < 3 else 2
                 per_map[map_idx] = econ_map_p
@@ -4664,6 +5262,8 @@ def _compute_and_post_ou(data, cancel_first=False, post_orders_flag=True, ioc=Fa
 
 def post_ou_orders(tickers_list, over_fair_cents, contracts, spread_cents):
     under_fair_cents = 100 - over_fair_cents
+    skip_over = (over_fair_cents - spread_cents) < 1
+    skip_under = (under_fair_cents - spread_cents) < 1
     over_bid = over_fair_cents - spread_cents
     under_bid = under_fair_cents - spread_cents
 
@@ -4687,12 +5287,12 @@ def post_ou_orders(tickers_list, over_fair_cents, contracts, spread_cents):
                 no_bid = ob['no_best_ask'] - 1
                 print(f"[MAKER] Under NO: capped -> {no_bid}c (ask={ob['no_best_ask']}c)")
 
-        if 1 <= yes_bid <= 99:
+        if 1 <= yes_bid <= 99 and not skip_over:
             orders_to_place.append({
                 'ticker': ticker, 'side': 'yes', 'price': yes_bid,
                 'team': 'Over 2.5 YES', 'fair': over_fair_cents,
             })
-        if 1 <= no_bid <= 99:
+        if 1 <= no_bid <= 99 and not skip_under:
             orders_to_place.append({
                 'ticker': ticker, 'side': 'no', 'price': no_bid,
                 'team': 'Under 2.5 NO', 'fair': under_fair_cents,
@@ -4720,6 +5320,8 @@ def post_ou_orders(tickers_list, over_fair_cents, contracts, spread_cents):
 
 def post_ou_ioc_orders(tickers_list, over_fair_cents, contracts, spread_cents):
     under_fair_cents = 100 - over_fair_cents
+    skip_over = (over_fair_cents - spread_cents) < 1
+    skip_under = (under_fair_cents - spread_cents) < 1
     over_bid = max(1, over_fair_cents - spread_cents)
     under_bid = max(1, under_fair_cents - spread_cents)
 
@@ -4731,12 +5333,12 @@ def post_ou_ioc_orders(tickers_list, over_fair_cents, contracts, spread_cents):
     orders_to_place = []
     for t in tickers_list:
         ticker = t['ticker']
-        if 1 <= over_bid <= 99:
+        if 1 <= over_bid <= 99 and not skip_over:
             orders_to_place.append({
                 'ticker': ticker, 'side': 'yes', 'price': over_bid,
                 'team': 'Over 2.5 YES', 'fair': over_fair_cents,
             })
-        if 1 <= under_bid <= 99:
+        if 1 <= under_bid <= 99 and not skip_under:
             orders_to_place.append({
                 'ticker': ticker, 'side': 'no', 'price': under_bid,
                 'team': 'Under 2.5 NO', 'fair': under_fair_cents,
@@ -4892,6 +5494,39 @@ def api_orderbook():
     return jsonify({'books': results})
 
 
+# ── Forfeit Iceberg Route ─────────────────────────────────────────────
+
+@app.route('/api/forfeit/ioc', methods=['POST'])
+def api_forfeit_ioc():
+    data = request.json
+    ticker = data.get('ticker', '')
+    side = data.get('side', 'yes')
+    max_price = data.get('max_price', 97)
+    count = data.get('count', 1)
+
+    if not ticker:
+        return jsonify({'error': 'No ticker'})
+
+    ob = _fetch_orderbook_prices(ticker)
+    if not ob:
+        return jsonify({'filled': 0, 'no_ask': True})
+
+    best_ask = ob.get(f'{side}_best_ask')
+    if best_ask is None:
+        return jsonify({'filled': 0, 'no_ask': True})
+
+    if best_ask > max_price:
+        return jsonify({'filled': 0, 'best_ask': best_ask, 'tried_price': max_price})
+
+    buy_price = best_ask
+    filled, total = place_ioc_order(ticker, side, count, buy_price)
+    print(f"[FORFEIT IOC] {side.upper()} {filled}/{count} @ {buy_price}c (ask={best_ask}c)")
+    return jsonify({
+        'filled': filled, 'count': count,
+        'fill_price': buy_price, 'best_ask': best_ask,
+    })
+
+
 # ── HLTV Scoreboard Routes ────────────────────────────────────────────
 
 @app.route('/api/hltv_live')
@@ -4953,23 +5588,56 @@ def api_predict():
     data = request.json
     team_a = data.get('team_a', '')
     team_b = data.get('team_b', '')
+    fmt = data.get('format', 'bo3')
     if not team_a or not team_b:
         return jsonify({'error': 'Need team_a and team_b'}), 400
     model, encoders, scale = load_model()
     try:
-        prob_a, _, _ = get_win_prob(model, encoders, team_a, team_b, scale)
+        raw_prob_a, _, _ = get_win_prob(model, encoders, team_a, team_b, scale)
     except Exception as e:
         return jsonify({'error': str(e)}), 400
     from train_model import load_matches, build_training_data
     df = build_training_data(load_matches())
     counts = df['team'].value_counts()
-    prob_b = 1 - prob_a
-    map_p = series_to_map_prob(prob_a)
-    p_2_1 = 2 * map_p * map_p * (1 - map_p)
-    p_1_2 = 2 * (1 - map_p) * (1 - map_p) * map_p
-    over_prob = p_2_1 + p_1_2
-    under_prob = 1 - over_prob
-    return jsonify({
+
+    if fmt == 'bo1':
+        map_p = series_to_map_prob(raw_prob_a)
+        prob_a = map_p
+        prob_b = 1 - prob_a
+        over_under = None
+    elif fmt == 'bo5':
+        map_p = series_to_map_prob(raw_prob_a)
+        q = 1 - map_p
+        prob_a = map_p**3 * (1 + 3*q + 6*q*q)
+        prob_b = 1 - prob_a
+        p_3_2 = 6 * map_p**3 * q**2
+        p_2_3 = 6 * q**3 * map_p**2
+        over_prob = p_3_2 + p_2_3
+        under_prob = 1 - over_prob
+        over_under = {
+            'line': '4.5',
+            'over_prob': round(over_prob, 4),
+            'under_prob': round(under_prob, 4),
+            'over_fair': int(round(over_prob * 100)),
+            'under_fair': int(round(under_prob * 100)),
+        }
+    else:
+        prob_a = raw_prob_a
+        prob_b = 1 - prob_a
+        map_p = series_to_map_prob(prob_a)
+        p_2_1 = 2 * map_p * map_p * (1 - map_p)
+        p_1_2 = 2 * (1 - map_p) * (1 - map_p) * map_p
+        over_prob = p_2_1 + p_1_2
+        under_prob = 1 - over_prob
+        over_under = {
+            'line': '2.5',
+            'over_prob': round(over_prob, 4),
+            'under_prob': round(under_prob, 4),
+            'over_fair': int(round(over_prob * 100)),
+            'under_fair': int(round(under_prob * 100)),
+        }
+
+    result = {
         'team_a': team_a, 'team_b': team_b,
         'prob_a': round(prob_a, 4),
         'prob_b': round(prob_b, 4),
@@ -4979,13 +5647,10 @@ def api_predict():
         'ml_b': _prob_to_american(prob_b),
         'games_a': int(counts.get(team_a, 0)),
         'games_b': int(counts.get(team_b, 0)),
-        'over_under': {
-            'over_prob': round(over_prob, 4),
-            'under_prob': round(under_prob, 4),
-            'over_fair': int(round(over_prob * 100)),
-            'under_fair': int(round(under_prob * 100)),
-        },
-    })
+    }
+    if over_under:
+        result['over_under'] = over_under
+    return jsonify(result)
 
 
 @app.route('/api/bracket_simulate', methods=['POST'])
@@ -5130,9 +5795,30 @@ def api_bracket_simulate():
                 seeds = {participants[i]: i for i in range(num_p)}
                 wins = np.zeros(num_p, dtype=int)
                 losses = np.zeros(num_p, dtype=int)
-                active = list(range(num_p))
+
+                if st.get('mid_stage'):
+                    slot_records = {}
+                    for slot in st['slots']:
+                        if slot['type'] == 'team':
+                            ti = team_idx_map.get(slot['team'])
+                            if ti is not None:
+                                slot_records[ti] = (slot.get('wins', 0), slot.get('losses', 0))
+                    for pi in range(num_p):
+                        t = participants[pi]
+                        if t in slot_records:
+                            wins[pi] = slot_records[t][0]
+                            losses[pi] = slot_records[t][1]
+
+                active = []
                 advanced = []
                 eliminated = []
+                for pi in range(num_p):
+                    if wins[pi] >= w2a:
+                        advanced.append(pi)
+                    elif losses[pi] >= l2e:
+                        eliminated.append(pi)
+                    else:
+                        active.append(pi)
 
                 max_rounds = w2a + l2e - 1
                 for _ in range(max_rounds):
@@ -5149,7 +5835,18 @@ def api_bracket_simulate():
                         pool.sort(key=lambda pi: seeds[participants[pi]])
                         is_adv_match = wins[pool[0]] == w2a - 1
                         is_elim_match = losses[pool[0]] == l2e - 1
-                        wp = wp_by_bo[3] if (is_adv_match or is_elim_match) else wp_by_bo[1]
+                        match_bo = st.get('match_bo', 1)
+                        decider_bo = st.get('decider_bo', 3)
+                        bo = decider_bo if (is_adv_match or is_elim_match) else match_bo
+                        if bo not in wp_by_bo:
+                            bo_formats.add(bo)
+                            wp_new = np.full((n, n), 0.5)
+                            for ii in range(n):
+                                for jj in range(ii + 1, n):
+                                    wp_new[ii][jj] = map_prob_to_series(map_wp[ii][jj], bo)
+                                    wp_new[jj][ii] = 1.0 - wp_new[ii][jj]
+                            wp_by_bo[bo] = wp_new
+                        wp = wp_by_bo[bo]
                         half = len(pool) // 2
                         for mi in range(half):
                             p1 = pool[mi]
@@ -5298,7 +5995,9 @@ def api_futures_fetch_event():
     if not url:
         return jsonify({'error': 'No URL provided'})
 
-    if 'polymarket.com' in url or (not url.startswith('KALSHI:') and 'kalshi.com' not in url):
+    if url.lower() == 'kalshi':
+        return _fetch_kalshi_cs2_futures()
+    elif 'polymarket.com' in url or (not url.startswith('KALSHI:') and 'kalshi.com' not in url):
         return _fetch_poly_futures(url)
     else:
         return _fetch_kalshi_futures(url)
@@ -5378,6 +6077,46 @@ def _fetch_poly_futures(url):
     return jsonify({'markets': markets_out, 'event_title': event.get('title', slug)})
 
 
+def _fetch_kalshi_cs2_futures():
+    """Return list of CS2 futures events (no markets yet — user picks one first)."""
+    MATCH_SERIES = ('KXCS2GAME', 'KXCS2MAP', 'KXCS2TOTALMAPS')
+    CS2_SERIES = ['KXCS2', 'KXCS2QUALIFIERS']
+    try:
+        hdrs = make_auth_headers(PRIVATE_KEY, API_KEY_ID, 'GET',
+                                  '/trade-api/v2/events') if PRIVATE_KEY else {}
+        all_events = []
+        for series in CS2_SERIES:
+            cursor = None
+            while True:
+                params = {'series_ticker': series, 'status': 'open', 'limit': 200}
+                if cursor:
+                    params['cursor'] = cursor
+                resp = http_requests.get(f"{KALSHI_BASE}/events", headers=hdrs,
+                                          params=params, timeout=10)
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                batch = data.get('events', [])
+                for ev in batch:
+                    et = ev.get('event_ticker', '')
+                    if not any(et.startswith(p) for p in MATCH_SERIES):
+                        all_events.append({
+                            'event_ticker': et,
+                            'title': ev.get('title') or ev.get('sub_title') or et,
+                            'series_ticker': ev.get('series_ticker', series),
+                        })
+                cursor = data.get('cursor', '')
+                if not cursor or not batch:
+                    break
+
+        if not all_events:
+            return jsonify({'error': 'No CS2 futures events found on Kalshi'})
+    except Exception as e:
+        return jsonify({'error': f'Fetch failed: {e}'})
+
+    return jsonify({'mode': 'event_list', 'events': all_events})
+
+
 def _fetch_kalshi_futures(url):
     ticker = url.replace('KALSHI:', '').strip()
     if 'kalshi.com' in ticker:
@@ -5385,20 +6124,44 @@ def _fetch_kalshi_futures(url):
         ticker = parts[-1] if parts else ticker
 
     try:
-        params = {'event_ticker': ticker, 'status': 'open', 'limit': 200}
         hdrs = make_auth_headers(PRIVATE_KEY, API_KEY_ID, 'GET',
                                   '/trade-api/v2/markets') if PRIVATE_KEY else {}
+        raw_markets = []
+
+        # 1) Try as event_ticker
+        params = {'event_ticker': ticker, 'status': 'open', 'limit': 200}
         resp = http_requests.get(f"{KALSHI_BASE}/markets", headers=hdrs,
                                   params=params, timeout=10)
-        raw_markets = []
         if resp.status_code == 200:
             raw_markets = resp.json().get('markets', [])
+
+        # 2) If that failed and ticker has 2+ dashes, it may be a market ticker —
+        #    derive event ticker by stripping the last segment
+        if not raw_markets and ticker.count('-') >= 2:
+            event_ticker = '-'.join(ticker.split('-')[:-1])
+            params = {'event_ticker': event_ticker, 'status': 'open', 'limit': 200}
+            resp = http_requests.get(f"{KALSHI_BASE}/markets", headers=hdrs,
+                                      params=params, timeout=10)
+            if resp.status_code == 200:
+                raw_markets = resp.json().get('markets', [])
+
+        # 3) Try as series_ticker
         if not raw_markets:
             params = {'series_ticker': ticker, 'status': 'open', 'limit': 200}
             resp = http_requests.get(f"{KALSHI_BASE}/markets", headers=hdrs,
                                       params=params, timeout=10)
             if resp.status_code == 200:
                 raw_markets = resp.json().get('markets', [])
+
+        # 4) Try as a single market ticker directly
+        if not raw_markets:
+            resp = http_requests.get(f"{KALSHI_BASE}/markets/{ticker}",
+                                      headers=hdrs, timeout=10)
+            if resp.status_code == 200:
+                mkt = resp.json().get('market')
+                if mkt:
+                    raw_markets = [mkt]
+
         if not raw_markets:
             return jsonify({'error': f'No markets found for {ticker}'})
     except Exception as e:
@@ -5452,6 +6215,8 @@ def api_futures_post_orders():
     size = data.get('size', 50)
     results = []
 
+    per_layer = max(1, size // LAYER_COUNT)
+
     def _post_one(order):
         fair = order['fair_prob']
         platform = order['platform']
@@ -5466,43 +6231,53 @@ def api_futures_post_orders():
 
             posted = []
 
-            # Yes side
-            bid_yes = round(fair - spread_cents / 100, 2)
+            # Yes side — layered
+            base_yes = round(fair - spread_cents / 100, 2)
             ob_yes = get_poly_orderbook(token_yes)
             ask_yes = poly_best_ask(ob_yes)
-            if bid_yes >= ask_yes:
-                bid_yes = round(ask_yes - tick, 2)
+            if base_yes >= ask_yes > 0:
+                base_yes = round(ask_yes - tick, 2)
 
-            if bid_yes >= tick:
-                if DRY_RUN or not POLY_CLIENT:
-                    posted.append(f'YES@{bid_yes:.2f}(dry)')
-                else:
-                    POLY_CLIENT.cancel_token_orders(token_yes)
-                    resp = POLY_CLIENT.place_order(token_yes, "BUY", bid_yes, size,
-                                                    tick_size=tick_size, neg_risk=neg_risk)
-                    posted.append(f'YES@{bid_yes:.2f}' if resp else 'YES:FAIL')
-                with FUTURES_TOKEN_LOCK:
-                    FUTURES_TOKEN_IDS.append(token_yes)
+            if DRY_RUN or not POLY_CLIENT:
+                for layer in range(LAYER_COUNT):
+                    bid = round(base_yes - layer * tick, 2)
+                    if bid >= tick:
+                        posted.append(f'YES@{bid:.2f}x{per_layer}(dry)')
+            else:
+                POLY_CLIENT.cancel_token_orders(token_yes)
+                for layer in range(LAYER_COUNT):
+                    bid = round(base_yes - layer * tick, 2)
+                    if bid >= tick:
+                        resp = POLY_CLIENT.place_order(token_yes, "BUY", bid, per_layer,
+                                                        tick_size=tick_size, neg_risk=neg_risk)
+                        posted.append(f'YES@{bid:.2f}x{per_layer}' if resp else f'YES@{bid:.2f}:FAIL')
+            with FUTURES_TOKEN_LOCK:
+                FUTURES_TOKEN_IDS.append(token_yes)
 
-            # No side
+            # No side — layered
             if token_no:
                 fair_no = 1.0 - fair
-                bid_no = round(fair_no - spread_cents / 100, 2)
+                base_no = round(fair_no - spread_cents / 100, 2)
                 ob_no = get_poly_orderbook(token_no)
                 ask_no = poly_best_ask(ob_no)
-                if bid_no >= ask_no:
-                    bid_no = round(ask_no - tick, 2)
+                if base_no >= ask_no > 0:
+                    base_no = round(ask_no - tick, 2)
 
-                if bid_no >= tick:
-                    if DRY_RUN or not POLY_CLIENT:
-                        posted.append(f'NO@{bid_no:.2f}(dry)')
-                    else:
-                        POLY_CLIENT.cancel_token_orders(token_no)
-                        resp = POLY_CLIENT.place_order(token_no, "BUY", bid_no, size,
-                                                        tick_size=tick_size, neg_risk=neg_risk)
-                        posted.append(f'NO@{bid_no:.2f}' if resp else 'NO:FAIL')
-                    with FUTURES_TOKEN_LOCK:
-                        FUTURES_TOKEN_IDS.append(token_no)
+                if DRY_RUN or not POLY_CLIENT:
+                    for layer in range(LAYER_COUNT):
+                        bid = round(base_no - layer * tick, 2)
+                        if bid >= tick:
+                            posted.append(f'NO@{bid:.2f}x{per_layer}(dry)')
+                else:
+                    POLY_CLIENT.cancel_token_orders(token_no)
+                    for layer in range(LAYER_COUNT):
+                        bid = round(base_no - layer * tick, 2)
+                        if bid >= tick:
+                            resp = POLY_CLIENT.place_order(token_no, "BUY", bid, per_layer,
+                                                            tick_size=tick_size, neg_risk=neg_risk)
+                            posted.append(f'NO@{bid:.2f}x{per_layer}' if resp else f'NO@{bid:.2f}:FAIL')
+                with FUTURES_TOKEN_LOCK:
+                    FUTURES_TOKEN_IDS.append(token_no)
 
             if not posted:
                 return {'team': team, 'status': 'skipped', 'reason': 'bids too low'}
@@ -5515,34 +6290,38 @@ def api_futures_post_orders():
             ob = fetch_orderbook_best_ask(ticker)
             posted = []
 
-            # Yes side
-            bid_yes = max(1, round(fair * 100) - spread_cents)
+            # Yes side — layered
+            base_yes = max(1, round(fair * 100) - spread_cents)
             if ob and ob.get('yes_best_ask') is not None:
-                if bid_yes >= ob['yes_best_ask']:
-                    bid_yes = ob['yes_best_ask'] - 1
+                if base_yes >= ob['yes_best_ask']:
+                    base_yes = ob['yes_best_ask'] - 1
 
-            if bid_yes >= 1:
-                if DRY_RUN:
-                    posted.append(f'YES@{bid_yes}c(dry)')
-                else:
-                    resp = place_limit_order(API_KEY_ID, PRIVATE_KEY, ticker, 'yes',
-                                              size, bid_yes, DRY_RUN)
-                    posted.append(f'YES@{bid_yes}c' if resp else 'YES:FAIL')
+            for layer in range(LAYER_COUNT):
+                bid = base_yes - layer
+                if bid >= 1:
+                    if DRY_RUN:
+                        posted.append(f'YES@{bid}cx{per_layer}(dry)')
+                    else:
+                        resp = place_limit_order(API_KEY_ID, PRIVATE_KEY, ticker, 'yes',
+                                                  per_layer, bid, DRY_RUN)
+                        posted.append(f'YES@{bid}cx{per_layer}' if resp else f'YES@{bid}c:FAIL')
 
-            # No side
+            # No side — layered
             fair_no = 1.0 - fair
-            bid_no = max(1, round(fair_no * 100) - spread_cents)
+            base_no = max(1, round(fair_no * 100) - spread_cents)
             if ob and ob.get('no_best_ask') is not None:
-                if bid_no >= ob['no_best_ask']:
-                    bid_no = ob['no_best_ask'] - 1
+                if base_no >= ob['no_best_ask']:
+                    base_no = ob['no_best_ask'] - 1
 
-            if bid_no >= 1:
-                if DRY_RUN:
-                    posted.append(f'NO@{bid_no}c(dry)')
-                else:
-                    resp = place_limit_order(API_KEY_ID, PRIVATE_KEY, ticker, 'no',
-                                              size, bid_no, DRY_RUN)
-                    posted.append(f'NO@{bid_no}c' if resp else 'NO:FAIL')
+            for layer in range(LAYER_COUNT):
+                bid = base_no - layer
+                if bid >= 1:
+                    if DRY_RUN:
+                        posted.append(f'NO@{bid}cx{per_layer}(dry)')
+                    else:
+                        resp = place_limit_order(API_KEY_ID, PRIVATE_KEY, ticker, 'no',
+                                                  per_layer, bid, DRY_RUN)
+                        posted.append(f'NO@{bid}cx{per_layer}' if resp else f'NO@{bid}c:FAIL')
 
             if not posted:
                 return {'team': team, 'status': 'skipped'}
@@ -5637,12 +6416,20 @@ def api_swiss_simulate():
             return p**3 * (6*p*p - 15*p + 10)
         return p * p * (3 - 2 * p)
 
-    wp_bo1 = np.copy(map_wp)
-    wp_bo3 = np.full((n, n), 0.5)
-    for i in range(n):
-        for j in range(i + 1, n):
-            wp_bo3[i][j] = map_prob_to_series(map_wp[i][j], 3)
-            wp_bo3[j][i] = 1.0 - wp_bo3[i][j]
+    wp_by_bo = {}
+    wp_by_bo[1] = np.copy(map_wp)
+    all_bos = {1, 3}
+    for st in stages_data:
+        all_bos.add(st.get('match_bo', 1))
+        all_bos.add(st.get('decider_bo', 3))
+    for bo in all_bos:
+        if bo not in wp_by_bo:
+            wp_new = np.full((n, n), 0.5)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    wp_new[i][j] = map_prob_to_series(map_wp[i][j], bo)
+                    wp_new[j][i] = 1.0 - wp_new[i][j]
+            wp_by_bo[bo] = wp_new
 
     n_stages = len(stages_data)
     stage_advance_count = np.zeros((n_stages, n), dtype=int)
@@ -5705,9 +6492,30 @@ def api_swiss_simulate():
             seeds = {participants[i]: i for i in range(num_p)}
             wins = np.zeros(num_p, dtype=int)
             losses = np.zeros(num_p, dtype=int)
-            active = list(range(num_p))
+
+            if st.get('mid_stage'):
+                slot_records = {}
+                for slot in st['slots']:
+                    if slot['type'] == 'team':
+                        ti = team_idx.get(slot['team'])
+                        if ti is not None:
+                            slot_records[ti] = (slot.get('wins', 0), slot.get('losses', 0))
+                for pi in range(num_p):
+                    t = participants[pi]
+                    if t in slot_records:
+                        wins[pi] = slot_records[t][0]
+                        losses[pi] = slot_records[t][1]
+
+            active = []
             advanced = []
             eliminated = []
+            for pi in range(num_p):
+                if wins[pi] >= w2a:
+                    advanced.append(pi)
+                elif losses[pi] >= l2e:
+                    eliminated.append(pi)
+                else:
+                    active.append(pi)
 
             max_rounds = w2a + l2e - 1
             for _ in range(max_rounds):
@@ -5727,7 +6535,10 @@ def api_swiss_simulate():
 
                     is_adv_match = wins[pool[0]] == w2a - 1
                     is_elim_match = losses[pool[0]] == l2e - 1
-                    wp = wp_bo3 if (is_adv_match or is_elim_match) else wp_bo1
+                    match_bo = st.get('match_bo', 1)
+                    decider_bo = st.get('decider_bo', 3)
+                    bo = decider_bo if (is_adv_match or is_elim_match) else match_bo
+                    wp = wp_by_bo.get(bo, wp_by_bo[1])
 
                     half = len(pool) // 2
                     for mi in range(half):
