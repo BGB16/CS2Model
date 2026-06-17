@@ -27,18 +27,31 @@ CHROME_DEBUG_URL = "http://localhost:9222"
 class HLTVBrowser:
     """Connect to Chrome running with --remote-debugging-port=9222."""
 
+    PAGE_REFRESH_INTERVAL = 50
+
     def __init__(self):
         self._pw = None
         self._browser = None
+        self._ctx = None
         self._page = None
+        self._loads = 0
 
     def start(self):
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.connect_over_cdp(CHROME_DEBUG_URL)
-        ctx = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context()
-        self._page = ctx.new_page()
+        self._ctx = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context()
+        self._page = self._ctx.new_page()
+        self._loads = 0
         print("  [HLTV] Connected to Chrome debug instance")
+
+    def _refresh_page(self):
+        try:
+            self._page.close()
+        except Exception:
+            pass
+        self._page = self._ctx.new_page()
+        self._loads = 0
 
     def stop(self):
         if self._page:
@@ -55,12 +68,16 @@ class HLTVBrowser:
             self._pw.stop()
         self._pw = None
         self._browser = None
+        self._ctx = None
         self._page = None
 
     def get_page_html(self, url, timeout=20000):
         if not self._page:
             self.start()
+        if self._loads >= self.PAGE_REFRESH_INTERVAL:
+            self._refresh_page()
         self._page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        self._loads += 1
         return self._page.content()
 
 

@@ -25,7 +25,7 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 MODEL_DIR = os.path.join(DATA_DIR, 'model')
 MATCHES_FILE = os.path.join(DATA_DIR, 'matches.csv')
 
-HALF_LIFE_DAYS = 120
+HALF_LIFE_DAYS = 75
 ALPHA = 1.0
 MIN_MATCHES = 10
 
@@ -110,8 +110,8 @@ def train(df, half_life=None, alpha=None):
     X, encoders = build_features(train_df, fit=True)
     y = train_df['win'].values.astype(float)
 
-    max_date = train_df['date'].max()
-    days_ago = (max_date - train_df['date']).dt.total_seconds() / 86400.0
+    team_max_date = train_df.groupby('team')['date'].transform('max')
+    days_ago = (team_max_date - train_df['date']).dt.total_seconds() / 86400.0
     lam = np.log(2) / half_life
     time_weights = np.exp(-lam * days_ago.values)
     bo_weights = train_df['best_of'].map(BO_WEIGHT).fillna(0.8).values

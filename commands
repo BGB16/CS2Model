@@ -57,7 +57,7 @@ PEM="/Users/blakegordon/PycharmProjects/CBAModel/key.pem"
 python3 kalshi_edge.py limit --spread 6 --contracts 50 --max-contracts 100 --max-position 100 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem
 
 # --- HOUSE MODE (no book — fair minus spread only) ---
-python3 kalshi_edge.py limit --no-book --spread 6 --contracts 75 --max-contracts 300 --max-position 300 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt --poly-contracts 100
+python3 kalshi_edge.py limit --no-book --spread 5 --contracts 75 --max-contracts 300 --max-position 300 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt --poly-contracts 100
 
 
 # --- HOUSE MODE LOOP (every 10 min, cancels stale + reposts) ---
@@ -108,11 +108,11 @@ python3 kalshi_edge.py limit --no-book --spread 6 --contracts 75 --max-contracts
 python3 live_trader.py --contracts 100 --spread 4 --port 5052 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt
 
 # --- Start Chrome debug instance first (run once) ---
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --remote-allow-origins=\* --user-data-dir=/tmp/chrome_debug &
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --remote-allow-origins=\* --user-data-dir=$HOME/.chrome_debug --disable-gpu --disable-extensions --disable-background-networking &
 
 python3 hltv_map_monitor.py
 
-python3 auto_map_trader.py --contracts 200 --spread 4 --ttl 300 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt --poly-contracts 100
+python3 auto_map_trader.py --contracts 100 --spread 6 --ttl 200 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt --poly-contracts 50
 
 # --- GIT ---
 git add -A && git commit -m "update" && git push

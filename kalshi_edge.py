@@ -1151,10 +1151,45 @@ def limit_cmd(args):
 
     prev_round_orders = {}
     seen_fills = set()
+    RETRAIN_EVERY = 24  # rounds (24 * 10min = 4 hours)
 
     round_num = 0
     while True:
         round_num += 1
+
+        if round_num > 1 and round_num % RETRAIN_EVERY == 1:
+            print(f"\n  [RETRAIN] Scraping HLTV + retraining model...")
+            try:
+                _rc = _sp.run(
+                    [sys.executable, 'scrape_hltv.py'],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    timeout=300, capture_output=True, text=True,
+                )
+                if _rc.returncode == 0:
+                    print(f"  [RETRAIN] Scrape OK")
+                else:
+                    print(f"  [RETRAIN] Scrape failed (rc={_rc.returncode}): {_rc.stderr[:200]}")
+            except Exception as e:
+                print(f"  [RETRAIN] Scrape error: {e}")
+            try:
+                _rc = _sp.run(
+                    [sys.executable, 'train_model.py'],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    timeout=300, capture_output=True, text=True,
+                )
+                if _rc.returncode == 0:
+                    print(f"  [RETRAIN] Train OK — reloading model")
+                    model, encoders, scale = load_model()
+                    team_names = list(encoders['team'].categories_[0])
+                    from train_model import load_matches, build_training_data
+                    _df_matches = load_matches()
+                    _train_df = build_training_data(_df_matches)
+                    team_match_counts = _train_df['team'].value_counts().to_dict()
+                else:
+                    print(f"  [RETRAIN] Train failed (rc={_rc.returncode}): {_rc.stderr[:200]}")
+            except Exception as e:
+                print(f"  [RETRAIN] Train error: {e}")
+
         now = datetime.datetime.now(datetime.timezone.utc)
         mode = "DRY RUN" if args.dry_run else "LIVE"
         print(f"\n{'='*60}")
@@ -1726,7 +1761,7 @@ def limit_cmd(args):
                 print()
 
         # --- UNDER 2.5 MAPS (NO-only on KXCS2TOTALMAPS) ---
-        ou_spread = max(1, args.spread // 3)
+        ou_spread = args.spread
         ou_orders = 0
         for tm in totalmaps_markets:
             ticker = tm.get('ticker', '')

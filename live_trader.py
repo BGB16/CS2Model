@@ -32,7 +32,11 @@ from kalshi_edge import (
     determine_yes_team, match_kalshi_team,
     load_model, get_win_prob, fetch_orderbook_best_ask,
 )
-from poly_cs2 import PolyClient, get_poly_orderbook, get_best_ask as poly_best_ask, GAMMA_BASE
+from poly_cs2 import (
+    PolyClient, get_poly_orderbook, get_best_ask as poly_best_ask,
+    get_best_bid as poly_best_bid, fetch_poly_cs2_markets, GAMMA_BASE,
+)
+from screen_tracker import ScreenTracker, _deps_available as tracker_deps_available, _missing_deps as tracker_missing_deps
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
@@ -46,8 +50,11 @@ PLACED_ORDER_IDS = []
 PLACED_ORDER_LOCK = threading.Lock()
 
 POLY_CLIENT = None
+SCREEN_TRACKER = ScreenTracker()
 FUTURES_TOKEN_IDS = []
 FUTURES_TOKEN_LOCK = threading.Lock()
+POLY_TOKEN_IDS = []
+POLY_TOKEN_LOCK = threading.Lock()
 
 app = Flask(__name__)
 
@@ -131,6 +138,17 @@ PLANT_BONUS = 800
 MAX_MONEY = 16000
 START_MONEY = 800  # pistol round
 OT_START_MONEY = 10000  # most tournament OT formats
+
+MAP_CT_RATES = {
+    'mirage':  0.55,
+    'inferno': 0.53,
+    'nuke':    0.57,
+    'anubis':  0.52,
+    'ancient': 0.54,
+    'dust2':   0.51,
+    'vertigo': 0.54,
+    'train':   0.53,
+}
 
 
 def get_weapon_data(weapon_name):
@@ -404,6 +422,10 @@ def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
             ct_display_money = int(ct_avg)
             t_display_money = int(t_avg)
 
+            # Build projected player lists so forward-looking code uses next-round money
+            ct_players = [dict(p, money=ct_projected[i]) for i, p in enumerate(ct_players)]
+            t_players = [dict(p, money=t_projected[i]) for i, p in enumerate(t_players)]
+
         ct_buy = classify_buy_from_money(ct_avg, 'ct')
         t_buy = classify_buy_from_money(t_avg, 't')
 
@@ -525,79 +547,115 @@ def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
     ct_round_p = max(0.01, min(0.99, ct_round_p))
     home_round_p = ct_round_p if home_is_ct else (1 - ct_round_p)
 
-    # Economy-driven multi-round lookahead.
-    # One round of EV barely moves the map price. But a round's outcome
-    # determines the economy for the NEXT round, which determines buy levels.
-    # Project forward 2 rounds using economy to estimate buy matchups.
+    # ── Forward-looking economy projection ──
+    # Project what happens if home wins vs loses this round: what buys next
+    # round, and what does the map probability look like 2 rounds out?
+    # This runs for ALL phases so the user always sees the forward picture.
+
+    home_info_l = ct_info if home_is_ct else t_info
+    away_info_l = t_info if home_is_ct else ct_info
+    home_total_money = home_info_l['total_money']
+    away_total_money = away_info_l['total_money']
+    home_avg_money = home_info_l['avg_money']
+    away_avg_money = away_info_l['avg_money']
+
+    def _project_team_buy(players, won, loss_streak, bomb_plant_bonus=False):
+        """Project each player's next-round money and classify team buy."""
+        projected = []
+        for p in players:
+            m = p.get('money', 0)
+            if won:
+                m += WIN_REWARD
+            else:
+                m += LOSS_BONUS[min(loss_streak, len(LOSS_BONUS) - 1)]
+            if bomb_plant_bonus:
+                m += PLANT_BONUS
+            projected.append(min(MAX_MONEY, m))
+        if not projected:
+            return 'eco', 0
+        avg = sum(projected) / len(projected)
+        can_full = sum(1 for m in projected if m >= 3900)
+        if can_full >= 3:
+            buy = 'full'
+        elif avg >= 2400:
+            buy = 'force'
+        else:
+            buy = 'eco'
+        return buy, int(avg)
+
+    home_loss_streak = 0 if home_avg_money > 3500 else (1 if home_avg_money > 2000 else 2)
+    away_loss_streak = 0 if away_avg_money > 3500 else (1 if away_avg_money > 2000 else 2)
+
+    home_ct_players = ct_players if home_is_ct else t_players
+    away_ct_players = t_players if home_is_ct else ct_players
+
+    rh = round_history or []
+    cur_round = home_rounds + away_rounds
+    bomb_in_round = bomb_planted or any(
+        r.get('round') == cur_round and r.get('win_type') in ('bomb', 'defuse') for r in rh)
+    t_plant_bonus = bomb_in_round
+
+    # If home wins: home gets win reward, away gets loss bonus
+    hw_buy, hw_money = _project_team_buy(home_ct_players, True, 0)
+    al_buy, al_money = _project_team_buy(
+        away_ct_players, False, away_loss_streak + 1,
+        bomb_plant_bonus=(t_plant_bonus and not home_is_ct))
+
+    # If home loses: away gets win reward, home gets loss bonus
+    hl_buy, hl_money = _project_team_buy(
+        home_ct_players, False, home_loss_streak + 1,
+        bomb_plant_bonus=(t_plant_bonus and home_is_ct))
+    aw_buy, aw_money = _project_team_buy(away_ct_players, True, 0)
+
+    def _side_adjusted_matchup(ct_buy_level, t_buy_level):
+        """Buy matchup rate adjusted for CT/T side advantage."""
+        base = BUY_MATCHUP_RATES.get((ct_buy_level, t_buy_level), 0.50)
+        if ct_round_rate is not None and base == 0.50:
+            return ct_round_rate
+        if ct_round_rate is not None:
+            side_shift = (ct_round_rate - 0.50) * 0.6
+            return max(0.01, min(0.99, base + side_shift))
+        return base
+
+    # Next-round matchup rates (CT perspective)
+    if home_is_ct:
+        r2_ct_if_won = _side_adjusted_matchup(hw_buy, al_buy)
+        r2_ct_if_lost = _side_adjusted_matchup(hl_buy, aw_buy)
+    else:
+        r2_ct_if_won = _side_adjusted_matchup(al_buy, hw_buy)
+        r2_ct_if_lost = _side_adjusted_matchup(aw_buy, hl_buy)
+    r2_home_if_won = r2_ct_if_won if home_is_ct else (1 - r2_ct_if_won)
+    r2_home_if_lost = r2_ct_if_lost if home_is_ct else (1 - r2_ct_if_lost)
+
+    # Blend next-round rate with skill
+    skill_home_p = base_map_prob if home_is_ct else (1 - base_map_prob)
+    r2_home_p_if_won = 0.5 * r2_home_if_won + 0.5 * skill_home_p
+    r2_home_p_if_lost = 0.5 * r2_home_if_lost + 0.5 * skill_home_p
+
+    # 1-round lookahead (score-only)
     p_map_if_win = live_round_win_prob(home_rounds + 1, away_rounds, base_map_prob,
                                        home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
     p_map_if_lose = live_round_win_prob(home_rounds, away_rounds + 1, base_map_prob,
                                          home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
-    expected_map_p = home_round_p * p_map_if_win + (1 - home_round_p) * p_map_if_lose
 
-    if phase == 'live' and total_rounds < 24:
-        home_info_l = ct_info if home_is_ct else t_info
-        away_info_l = t_info if home_is_ct else ct_info
-        home_money = home_info_l['avg_money']
-        away_money = away_info_l['avg_money']
-        home_equip = home_info_l['total_value']
-        away_equip = away_info_l['total_value']
+    # 2-round lookahead (score + projected economy)
+    p_map_win_win = live_round_win_prob(home_rounds + 2, away_rounds, base_map_prob,
+                                         home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+    p_map_win_lose = live_round_win_prob(home_rounds + 1, away_rounds + 1, base_map_prob,
+                                          home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+    p_map_after_win = r2_home_p_if_won * p_map_win_win + (1 - r2_home_p_if_won) * p_map_win_lose
 
-        def _project_next_round_buy(winner_money, winner_equip, loser_money, loss_streak):
-            """Estimate next-round buy level after win/loss."""
-            # Winner: gets $3250 + keeps equipment
-            w_next = min(MAX_MONEY, winner_money + WIN_REWARD)
-            # Loser: gets loss bonus, loses equipment (weapons gone)
-            l_bonus = LOSS_BONUS[min(loss_streak, len(LOSS_BONUS) - 1)]
-            l_next = min(MAX_MONEY, loser_money + l_bonus)
-            w_buy = 'full' if w_next >= 3900 else ('force' if w_next >= 2400 else 'eco')
-            l_buy = 'full' if l_next >= 3900 else ('force' if l_next >= 2400 else 'eco')
-            return w_buy, l_buy
+    p_map_lose_win = live_round_win_prob(home_rounds + 1, away_rounds + 1, base_map_prob,
+                                          home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+    p_map_lose_lose = live_round_win_prob(home_rounds, away_rounds + 2, base_map_prob,
+                                           home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+    p_map_after_lose = r2_home_p_if_lost * p_map_lose_win + (1 - r2_home_p_if_lost) * p_map_lose_lose
 
-        # Estimate current loss streaks from money levels
-        home_loss_streak = 0 if home_money > 3500 else (1 if home_money > 2000 else 2)
-        away_loss_streak = 0 if away_money > 3500 else (1 if away_money > 2000 else 2)
-
-        # If home wins this round: home is winner, away loses
-        hw_buy, al_buy = _project_next_round_buy(
-            home_money, home_equip, away_money, away_loss_streak + 1)
-        # If home loses: away is winner, home loses
-        aw_buy, hl_buy = _project_next_round_buy(
-            away_money, away_equip, home_money, home_loss_streak + 1)
-
-        # Convert projected buys to round-2 win probability
-        r2_if_won = BUY_MATCHUP_RATES.get((hw_buy, al_buy) if home_is_ct else (al_buy, hw_buy), 0.50)
-        if not home_is_ct:
-            r2_if_won = 1 - r2_if_won
-        r2_if_lost = BUY_MATCHUP_RATES.get((hl_buy, aw_buy) if home_is_ct else (aw_buy, hl_buy), 0.50)
-        if not home_is_ct:
-            r2_if_lost = 1 - r2_if_lost
-        # Blend with skill
-        r2_home_p_if_won = 0.5 * r2_if_won + 0.5 * (base_map_prob if home_is_ct else 1 - base_map_prob)
-        r2_home_p_if_lost = 0.5 * r2_if_lost + 0.5 * (base_map_prob if home_is_ct else 1 - base_map_prob)
-
-        # 2-round lookahead: for each path (win/lose this round), project next round
-        # Path A: home wins R1, then R2 outcome
-        p_map_win_win = live_round_win_prob(home_rounds + 2, away_rounds, base_map_prob,
-                                             home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
-        p_map_win_lose = live_round_win_prob(home_rounds + 1, away_rounds + 1, base_map_prob,
-                                              home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
-        p_map_after_win = r2_home_p_if_won * p_map_win_win + (1 - r2_home_p_if_won) * p_map_win_lose
-
-        # Path B: home loses R1, then R2 outcome
-        p_map_lose_win = live_round_win_prob(home_rounds + 1, away_rounds + 1, base_map_prob,
-                                              home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
-        p_map_lose_lose = live_round_win_prob(home_rounds, away_rounds + 2, base_map_prob,
-                                               home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
-        p_map_after_lose = r2_home_p_if_lost * p_map_lose_win + (1 - r2_home_p_if_lost) * p_map_lose_lose
-
-        expected_map_p_2 = home_round_p * p_map_after_win + (1 - home_round_p) * p_map_after_lose
-
-        # Use the 2-round lookahead when the situation is lopsided
-        round_certainty = abs(home_round_p - 0.50) * 2
-        if round_certainty > 0.20:
-            blend = min(0.80, round_certainty)
-            expected_map_p = (1 - blend) * expected_map_p + blend * expected_map_p_2
+    # Blend 1-round and 2-round: always use 2-round, weighted more when economy matters
+    if total_rounds < 24:
+        expected_map_p = home_round_p * p_map_after_win + (1 - home_round_p) * p_map_after_lose
+    else:
+        expected_map_p = home_round_p * p_map_if_win + (1 - home_round_p) * p_map_if_lose
 
     home_info = ct_info if home_is_ct else t_info
     away_info = t_info if home_is_ct else ct_info
@@ -610,6 +668,8 @@ def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
         'away_buy': t_buy if home_is_ct else ct_buy,
         'home_avg_money': ct_display_money if home_is_ct else t_display_money,
         'away_avg_money': t_display_money if home_is_ct else ct_display_money,
+        'home_total_money': home_total_money,
+        'away_total_money': away_total_money,
         'home_avg_power': home_info['avg_power'],
         'away_avg_power': away_info['avg_power'],
         'home_alive': home_alive,
@@ -622,12 +682,44 @@ def economy_adjusted_map_prob(ct_players, t_players, base_map_prob,
         'econ_weight': round(econ_weight, 2),
         'home_round_p': round(home_round_p, 4),
         'econ_map_prob': round(expected_map_p, 4),
+        # Forward-looking: projected buys and map probs for each outcome
+        'home_buy_if_win': hw_buy,
+        'away_buy_if_win': al_buy,
+        'home_money_if_win': hw_money,
+        'away_money_if_win': al_money,
+        'home_buy_if_lose': hl_buy,
+        'away_buy_if_lose': aw_buy,
+        'home_money_if_lose': hl_money,
+        'away_money_if_lose': aw_money,
+        'map_prob_if_win': round(p_map_after_win, 4),
+        'map_prob_if_lose': round(p_map_after_lose, 4),
     }
 
     return expected_map_p, econ_detail
 
 
 # ── Probability ──────────────────────────────────────────────────────
+
+def power_devig(home_decimal, away_decimal):
+    """Devig two-way decimal odds using the power method.
+    Returns (home_fair_prob, away_fair_prob) as floats 0-1."""
+    imp_h = 1.0 / home_decimal
+    imp_a = 1.0 / away_decimal
+    lo, hi = 1.0, 10.0
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        total = imp_h ** mid + imp_a ** mid
+        if total > 1.0:
+            lo = mid
+        else:
+            hi = mid
+    k = (lo + hi) / 2.0
+    fair_h = imp_h ** k
+    fair_a = imp_a ** k
+    s = fair_h + fair_a
+    return fair_h / s, fair_a / s
+
+
 
 def series_to_map_prob(series_prob):
     """Derive per-map win probability from a BO3 series win probability.
@@ -779,10 +871,12 @@ def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob,
     OT: MR3 sets (6 rounds), win by 2. If 3-3 in OT set, new set starts.
     Derives per-round win rate from base_map_prob via brentq.
 
-    When home_is_ct and ct_round_rate are provided, uses side-aware round
-    probabilities: different p_round for first half vs second half to
-    account for the halftime side swap."""
-    if team1_rounds == 0 and team2_rounds == 0:
+    Side-aware: when home_is_ct and ct_round_rate are provided, uses
+    different p_round for each half. A team going 3-0 on T side of a
+    CT-sided map gets a bigger boost than 3-0 on CT side because they're
+    outperforming expectation on the weaker side."""
+    has_ct_adj = home_is_ct is not None and ct_round_rate is not None
+    if team1_rounds == 0 and team2_rounds == 0 and not has_ct_adj:
         return base_map_prob
 
     try:
@@ -817,26 +911,28 @@ def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob,
     except Exception:
         p_round = clamped
 
-    # Side-aware round probabilities for halftime flip.
-    # home_is_ct reflects the CURRENT side (HLTV flips at halftime).
-    # Determine first-half side from current side + which half we're in.
-    if home_is_ct is not None and ct_round_rate is not None:
-        ct_bonus = ct_round_rate - 0.50
-        total = team1_rounds + team2_rounds
-        first_half_ct = home_is_ct if total < 12 else (not home_is_ct)
-        if first_half_ct:
-            p_h1 = max(0.01, min(0.99, p_round + ct_bonus))
-            p_h2 = max(0.01, min(0.99, p_round - ct_bonus))
-        else:
-            p_h1 = max(0.01, min(0.99, p_round - ct_bonus))
-            p_h2 = max(0.01, min(0.99, p_round + ct_bonus))
+    # Side-aware round probabilities: shift the neutral p_round by the map's
+    # CT/T asymmetry. Going 3-0 on T side of a 57% CT map is outperforming
+    # expectation far more than 3-0 on CT side.
+    if has_ct_adj:
+        side_shift = ct_round_rate - 0.50
+        p_home_ct = max(0.01, min(0.99, p_round + side_shift))
+        p_home_t = max(0.01, min(0.99, p_round - side_shift))
     else:
-        p_h1 = p_round
-        p_h2 = p_round
+        p_home_ct = p_round
+        p_home_t = p_round
+
     p_ot = p_round
 
+    def _p_for_round(total_r):
+        """Home's round win probability based on which half/side they're on."""
+        if total_r < 12:
+            return p_home_ct if home_is_ct else p_home_t
+        elif total_r < 24:
+            return p_home_t if home_is_ct else p_home_ct
+        return p_ot
+
     def _from_state(h, a):
-        # Regulation: not yet 12-12
         if h < 12 or a < 12:
             if h >= 13:
                 return 1.0
@@ -853,7 +949,7 @@ def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob,
                     return _ot_win_prob(p_ot)
                 if (rh, ra) in memo:
                     return memo[(rh, ra)]
-                p = p_h1 if (rh + ra) < 12 else p_h2
+                p = _p_for_round(rh + ra)
                 memo[(rh, ra)] = (p * _reg(rh + 1, ra) +
                                   (1 - p) * _reg(rh, ra + 1))
                 return memo[(rh, ra)]
@@ -866,30 +962,24 @@ def live_round_win_prob(team1_rounds, team2_rounds, base_map_prob,
 
         ot_h = h - 12
         ot_a = a - 12
-        # Strip completed OT sets (3-3 ties restart)
         rh, ra = ot_h, ot_a
         while rh >= 3 and ra >= 3:
             rh -= 3
             ra -= 3
-        # rh, ra = position in current OT set (each set is 6 rounds, MR3)
 
         ot_memo = {}
 
         def _ot_rec(oh, oa):
-            # Win conditions: 4+ wins with 2+ lead, checked at set end
-            # Set is 6 rounds: after all 6, if not decided, 3-3 resets
             if oh + oa >= 6:
                 diff = oh - oa
                 if diff >= 2:
                     return 1.0
                 if diff <= -2:
                     return 0.0
-                # 3-3 tie: new OT set with same per-round prob
                 return _ot_win_prob(p_ot)
-            # Early clinch: can't lose even if opponent wins remaining
             remaining = 6 - oh - oa
             if oh - oa > remaining:
-                return 1.0  # opponent can't catch up
+                return 1.0
             if oa - oh > remaining:
                 return 0.0
             if (oh, oa) in ot_memo:
@@ -1236,10 +1326,12 @@ def post_ioc_orders(tickers_list, home_fair_cents, contracts, spread_cents,
                     home_name='HOME', away_name='AWAY'):
     """Post IOC orders concurrently."""
     away_fair_cents = 100 - home_fair_cents
-    skip_home = (home_fair_cents - spread_cents) < 1
-    skip_away = (away_fair_cents - spread_cents) < 1
-    home_bid = max(1, home_fair_cents - spread_cents)
-    away_bid = max(1, away_fair_cents - spread_cents)
+    closeness = min(home_fair_cents, away_fair_cents) / 50.0
+    adj_spread = max(1, int(round(spread_cents * (0.5 + 0.5 * closeness))))
+    skip_home = (home_fair_cents - adj_spread) < 1
+    skip_away = (away_fair_cents - adj_spread) < 1
+    home_bid = max(1, home_fair_cents - adj_spread)
+    away_bid = max(1, away_fair_cents - adj_spread)
 
     orders_to_place = []
     for t in tickers_list:
@@ -1331,6 +1423,71 @@ def _fetch_best_bid(ticker, side):
 
 HLTV_BASE = 'https://www.hltv.org'
 HLTV_SCRAPER = None
+LIVE_TRADER_CDP_PORT = 9223
+
+_lt_chrome_proc = None
+_lt_lock = threading.Lock()
+
+
+def _ensure_lt_chrome():
+    """Launch a dedicated Chrome debug instance on port 9223 if not already running."""
+    global _lt_chrome_proc
+    import subprocess, shutil, urllib.request
+
+    with _lt_lock:
+        # Check if already responding
+        try:
+            urllib.request.urlopen(f'http://localhost:{LIVE_TRADER_CDP_PORT}/json/version', timeout=2)
+            return
+        except Exception:
+            pass
+
+        if _lt_chrome_proc is not None and _lt_chrome_proc.poll() is None:
+            time.sleep(1)
+            return
+
+        chrome_paths = [
+            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            shutil.which('google-chrome') or '',
+            shutil.which('google-chrome-stable') or '',
+        ]
+        chrome_bin = next((p for p in chrome_paths if p and os.path.exists(p)), None)
+        if not chrome_bin:
+            raise RuntimeError("Chrome not found")
+        _lt_chrome_proc = subprocess.Popen([
+            chrome_bin,
+            f'--remote-debugging-port={LIVE_TRADER_CDP_PORT}',
+            '--no-first-run',
+            '--no-default-browser-check',
+            f'--user-data-dir={os.path.expanduser("~/.chrome-live-trader")}',
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Wait for debug port to become available
+        for _ in range(10):
+            time.sleep(1)
+            try:
+                urllib.request.urlopen(f'http://localhost:{LIVE_TRADER_CDP_PORT}/json/version', timeout=2)
+                break
+            except Exception:
+                continue
+        print(f"[HLTV] Launched Chrome debug on port {LIVE_TRADER_CDP_PORT}")
+
+
+def _cdp_get_tabs():
+    """Get list of open tabs from Chrome debug protocol (no Playwright needed)."""
+    import urllib.request, json
+    resp = urllib.request.urlopen(f'http://localhost:{LIVE_TRADER_CDP_PORT}/json', timeout=5)
+    return json.loads(resp.read())
+
+
+def _cdp_find_tab(url_fragment):
+    """Find an open tab whose URL contains url_fragment. Returns the tab info dict or None."""
+    try:
+        for tab in _cdp_get_tabs():
+            if tab.get('type') == 'page' and url_fragment in (tab.get('url') or ''):
+                return tab
+    except Exception:
+        pass
+    return None
 
 
 class HLTVScoreboard:
@@ -1366,37 +1523,59 @@ class HLTVScoreboard:
             print("[HLTV] playwright not installed")
             return
 
+        try:
+            _ensure_lt_chrome()
+        except Exception as e:
+            print(f"[HLTV] Could not start Chrome debug: {e}")
+            self._running = False
+            return
+
+        full_url = f'{HLTV_BASE}{match_url}'
+
         with sync_playwright() as pw:
             try:
-                browser = pw.chromium.connect_over_cdp("http://localhost:9222")
-                print("[HLTV] Connected to Chrome debug instance")
+                browser = pw.chromium.connect_over_cdp(f"http://localhost:{LIVE_TRADER_CDP_PORT}")
             except Exception as e:
-                print(f"[HLTV] Could not connect to Chrome debug (is it running on port 9222?): {e}")
+                print(f"[HLTV] Could not connect to Chrome on port {LIVE_TRADER_CDP_PORT}: {e}")
                 self._running = False
                 return
 
-            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = ctx.new_page()
+            page = None
+            opened_new = False
 
-            full_url = f'{HLTV_BASE}{match_url}'
-            print(f"[HLTV] Navigating to {full_url}")
+            # Find existing tab with this match
+            for ctx in browser.contexts:
+                for p in ctx.pages:
+                    try:
+                        if match_url in (p.url or ''):
+                            page = p
+                            print(f"[HLTV] Found existing tab: {p.url}")
+                            break
+                    except Exception:
+                        continue
+                if page:
+                    break
 
-            try:
-                page.goto(full_url, timeout=30000, wait_until='domcontentloaded')
-                # Wait for Cloudflare challenge
-                for _ in range(30):
-                    if 'just a moment' not in (page.title() or '').lower():
-                        break
-                    time.sleep(1)
-                time.sleep(3)
-            except Exception as e:
-                print(f"[HLTV] Navigation error: {e}")
+            if page is None:
+                ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = ctx.new_page()
+                opened_new = True
+                print(f"[HLTV] Opening new tab for {full_url}")
                 try:
-                    page.close()
-                except Exception:
-                    pass
-                self._running = False
-                return
+                    page.goto(full_url, timeout=30000, wait_until='domcontentloaded')
+                    for _ in range(30):
+                        if 'just a moment' not in (page.title() or '').lower():
+                            break
+                        time.sleep(1)
+                    time.sleep(3)
+                except Exception as e:
+                    print(f"[HLTV] Navigation error: {e}")
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                    self._running = False
+                    return
 
             # Wait for scorebot to load and populate with player data
             print("[HLTV] Waiting for scorebot player data...")
@@ -1419,10 +1598,11 @@ class HLTVScoreboard:
                     print(f"[HLTV] Continuing anyway — data may populate during match")
                 else:
                     print("[HLTV] No scorebot element found — stopping")
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
+                    if opened_new:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
                     self._running = False
                     return
 
@@ -1473,10 +1653,11 @@ class HLTVScoreboard:
                     traceback.print_exc()
                 time.sleep(0.8)
 
-            try:
-                page.close()
-            except Exception:
-                pass
+            if opened_new:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
     def _parse(self, page):
         # Single JS evaluate — much faster than many query_selector calls
@@ -1701,16 +1882,54 @@ class HLTVScoreboard:
 
 
 def fetch_hltv_live_matches():
-    """Scrape HLTV /matches via Chrome debug for currently live matches."""
+    """Scrape HLTV /matches via the live-trader's own Chrome debug instance (port 9223).
+    Uses raw CDP websocket to get page HTML — no Playwright needed (thread-safe for Flask)."""
+    import json, urllib.request
     try:
         from bs4 import BeautifulSoup
-        from hltv_map_monitor import get_hltv_browser, close_hltv_browser
     except ImportError:
         return []
 
     try:
-        browser = get_hltv_browser()
-        html = browser.get_page_html(f'{HLTV_BASE}/matches', timeout=30000)
+        _ensure_lt_chrome()
+
+        # Find or create a /matches tab via CDP HTTP API
+        tab = _cdp_find_tab('hltv.org/matches')
+        if tab is None:
+            # Open a new tab navigating to /matches
+            encoded = urllib.request.quote(f'{HLTV_BASE}/matches', safe='')
+            urllib.request.urlopen(
+                f'http://localhost:{LIVE_TRADER_CDP_PORT}/json/new?{encoded}', timeout=10)
+            time.sleep(5)
+            tab = _cdp_find_tab('hltv.org/matches')
+            if tab is None:
+                print("[HLTV] Could not open /matches tab")
+                return []
+
+        # Use CDP websocket to get the page HTML
+        import websocket
+        ws_url = tab['webSocketDebuggerUrl']
+        ws = websocket.create_connection(ws_url, timeout=15)
+        try:
+            # Reload the page to get fresh data
+            ws.send(json.dumps({'id': 1, 'method': 'Page.reload'}))
+            time.sleep(4)
+            # Get the HTML
+            ws.send(json.dumps({
+                'id': 2, 'method': 'Runtime.evaluate',
+                'params': {'expression': 'document.documentElement.outerHTML'}
+            }))
+            resp = json.loads(ws.recv())
+            while resp.get('id') != 2:
+                resp = json.loads(ws.recv())
+            html = resp.get('result', {}).get('result', {}).get('value', '')
+        finally:
+            ws.close()
+
+        if not html:
+            print("[HLTV] Got empty page HTML")
+            return []
+
         soup = BeautifulSoup(html, 'html.parser')
 
         live_section = soup.find('div', class_='liveMatches')
@@ -1738,7 +1957,9 @@ def fetch_hltv_live_matches():
             })
         return matches
     except Exception as e:
+        import traceback
         print(f"[HLTV] Live match scrape failed: {e}")
+        traceback.print_exc()
         return []
 
 
@@ -2047,6 +2268,7 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
         <button class="tab" onclick="switchTab('bracket')">Bracket Builder</button>
         <button class="tab" onclick="switchTab('futures')">Futures</button>
         <button class="tab" onclick="switchTab('forfeit')">Forfeit</button>
+        <button class="tab" onclick="switchTab('screen')">Screen Track</button>
     </div>
 
     <div id="tab-predict" style="display:none;">
@@ -2213,7 +2435,8 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
             <option value="{{ g.home }}|{{ g.away }}"
                 data-home-prob="{{ g.home_prob }}"
                 data-tickers='{{ g.tickers_json }}'
-                data-ou-tickers='{{ g.ou_tickers_json }}'>
+                data-ou-tickers='{{ g.ou_tickers_json }}'
+                data-poly-series='{{ g.poly_series_json }}'>
                 {{ g.away }} vs {{ g.home }} &mdash; {{ g.home }} {{ g.home_pct }}
             </option>
             {% endfor %}
@@ -2278,11 +2501,37 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
             <span class="round-team-label" id="round-away-label">AWAY</span>
         </div>
 
+        <div class="alive-section" style="display:flex; align-items:center; gap:8px; margin:6px 0; flex-wrap:wrap;">
+            <span style="font-size:12px; color:#888;">Alive</span>
+            <span class="round-team-label" id="alive-home-label" style="font-size:12px;">HOME</span>
+            <button class="round-adj" onclick="adjAlive('home',-1)" style="background:#b71c1c;">&darr;</button>
+            <span class="round-val" id="home-alive" style="color:#4caf50; min-width:18px; text-align:center;">5</span>
+            <button class="round-adj" onclick="adjAlive('home',1)" style="background:#1b5e20;">&uarr;</button>
+            <span style="color:#555; font-size:16px; margin:0 4px;">v</span>
+            <button class="round-adj" onclick="adjAlive('away',-1)" style="background:#b71c1c;">&darr;</button>
+            <span class="round-val" id="away-alive" style="color:#ef5350; min-width:18px; text-align:center;">5</span>
+            <button class="round-adj" onclick="adjAlive('away',1)" style="background:#1b5e20;">&uarr;</button>
+            <span class="round-team-label" id="alive-away-label" style="font-size:12px;">AWAY</span>
+            <button class="round-adj" onclick="resetAlive()" style="background:#333; color:#888; font-size:10px; padding:2px 8px;">5v5</button>
+        </div>
+
         <div class="side-section" style="display:flex; align-items:center; gap:12px; margin:8px 0; flex-wrap:wrap;">
+            <span style="font-size:12px; color:#888;">Map:</span>
+            <select id="map-select" onchange="onMapSelect()" style="padding:4px 8px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+                <option value="">—</option>
+                <option value="mirage">Mirage (55/45)</option>
+                <option value="nuke">Nuke (57/43)</option>
+                <option value="inferno">Inferno (53/47)</option>
+                <option value="ancient">Ancient (54/46)</option>
+                <option value="anubis">Anubis (52/48)</option>
+                <option value="dust2">Dust2 (51/49)</option>
+                <option value="vertigo">Vertigo (54/46)</option>
+                <option value="train">Train (53/47)</option>
+            </select>
             <span style="font-size:12px; color:#888;">CT:</span>
             <select id="ct-team-select" onchange="computeFair();ouComputeFair()" style="padding:4px 8px;font-size:12px;background:#1a1a2e;color:#4fc3f7;border:1px solid #333;border-radius:4px;">
-                <option value="home">HOME</option>
-                <option value="away">AWAY</option>
+                <option value="home" id="ct-opt-home">HOME</option>
+                <option value="away" id="ct-opt-away">AWAY</option>
             </select>
             <span style="font-size:12px; color:#888;">CT%</span>
             <input type="number" id="ct-win-pct" placeholder="—" min="1" max="99" style="width:50px;padding:4px;font-size:12px;background:#1a1a2e;color:#4fc3f7;border:1px solid #333;border-radius:4px;text-align:center;" title="CT round win % (leave blank for model default)" onchange="computeFair();ouComputeFair()">
@@ -2293,19 +2542,22 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
 
         <div class="buy-section" style="display:flex; align-items:center; gap:10px; margin:4px 0; flex-wrap:wrap;">
             <span style="font-size:12px; color:#888;" id="home-buy-label">HOME:</span>
-            <select id="home-buy" onchange="computeFair();ouComputeFair()" style="padding:4px 6px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+            <select id="home-buy" onchange="onBuyChange('home')" style="padding:4px 6px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
                 <option value="">auto</option>
                 <option value="full">Full</option>
                 <option value="force">Force</option>
                 <option value="eco">Eco</option>
             </select>
+            <input type="number" id="home-money" placeholder="$" min="0" max="100000" style="width:62px;padding:4px;font-size:12px;background:#1a1a2e;color:#81c784;border:1px solid #333;border-radius:4px;text-align:center;" title="Team money sum (auto-sets buy type)" oninput="onMoneyInput('home')">
+            <span style="color:#555; margin:0 2px;">|</span>
             <span style="font-size:12px; color:#888;" id="away-buy-label">AWAY:</span>
-            <select id="away-buy" onchange="computeFair();ouComputeFair()" style="padding:4px 6px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+            <select id="away-buy" onchange="onBuyChange('away')" style="padding:4px 6px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
                 <option value="">auto</option>
                 <option value="full">Full</option>
                 <option value="force">Force</option>
                 <option value="eco">Eco</option>
             </select>
+            <input type="number" id="away-money" placeholder="$" min="0" max="100000" style="width:62px;padding:4px;font-size:12px;background:#1a1a2e;color:#ef9a9a;border:1px solid #333;border-radius:4px;text-align:center;" title="Team money sum (auto-sets buy type)" oninput="onMoneyInput('away')">
         </div>
 
         <div class="sb-section" id="sb-section" style="display:none;">
@@ -2372,13 +2624,48 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
             <button class="btn btn-ioc" onclick="postIOC()">IOC Take</button>
             <button class="btn btn-cancel-post" onclick="cancelRepost()">Cancel &amp; Repost</button>
             <button class="btn btn-danger" onclick="cancelAll()">Cancel All</button>
+            <button class="btn" id="auto-trade-btn" onclick="toggleAutoTrade()"
+                style="background:#1b5e20;color:#66bb6a;border-color:#66bb6a;font-weight:bold;">AUTO TRADE</button>
+            <button class="btn" id="screen-track-btn" onclick="toggleScreenTrack()"
+                style="background:#1a237e;color:#7986cb;border-color:#7986cb;font-weight:bold;">SCREEN TRACK</button>
+            <button class="btn" id="screen-trade-btn" onclick="toggleScreenTrade()" style="display:none;
+                background:#1b5e20;color:#66bb6a;border-color:#66bb6a;font-weight:bold;">TRADE ON</button>
         </div>
 
         <div class="kbd-help">
             <kbd>C</kbd> Compute &nbsp; <kbd>P</kbd> Auto-Reprice &nbsp;
             <kbd>I</kbd> IOC &nbsp; <kbd>R</kbd> Repost &nbsp; <kbd>X</kbd> Stop+Cancel &nbsp;
-            <kbd>J</kbd> Jump &nbsp; <kbd>B</kbd> Buy
+            <kbd>J</kbd> Jump &nbsp; <kbd>B</kbd> Buy &nbsp; <kbd>A</kbd> Auto Trade
             &nbsp; <span id="reprice-status"></span>
+        </div>
+
+        <div id="screen-trade-section" style="display:none; margin-top:14px; border:1px solid #1a237e; border-radius:6px; padding:12px;">
+            <h3 style="color:#7986cb; margin:0 0 8px;">Screen Odds Tracker</h3>
+            <div id="sct-tracked-games" style="margin-bottom:8px;"></div>
+            <div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+                <button class="btn" id="sct-stream-toggle" onclick="sctToggleStream()" style="padding:4px 12px;font-size:11px;background:#333;">Live View</button>
+                <button class="btn sct-region-btn" id="sct-rgn-btn-scoreboard" onclick="sctSetRegionMode('scoreboard')"
+                        style="padding:4px 10px;font-size:11px;background:#333;border:1px solid #555;">Mark Odds Region</button>
+                <button class="btn" id="sct-add-game-btn" onclick="sctAddCurrentGame()"
+                        style="padding:4px 10px;font-size:11px;background:#1a237e;color:#7986cb;border:1px solid #7986cb;">Add Game</button>
+                <button class="btn" onclick="sctClearAll()" style="padding:4px 8px;font-size:11px;background:#333;color:#ef5350;">Clear All</button>
+                <span id="sct-stream-fps" style="font-size:11px; color:#444;"></span>
+            </div>
+            <div id="sct-screenshot-container" style="position:relative; max-width:100%; overflow:hidden;
+                 border:1px solid #333; border-radius:4px; height:250px; background:#111; display:none;">
+                <div id="sct-screen-inner" style="transform-origin:0 0; position:relative; width:100%;">
+                    <img id="sct-screen-img" style="display:none; width:100%;">
+                    <canvas id="sct-screen-canvas" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
+                </div>
+            </div>
+            <div id="sct-sb-section" style="display:none; margin-top:8px;">
+                <div id="sct-mark-buttons" style="display:flex; gap:6px; margin-bottom:6px; align-items:center; flex-wrap:wrap;"></div>
+                <div id="sct-sb-preview" style="position:relative; border:1px solid #7986cb; border-radius:4px;
+                     background:#111; overflow:hidden; cursor:crosshair; max-height:150px;">
+                    <img id="sct-sb-img" style="display:block; width:100%;">
+                    <canvas id="sct-sb-canvas" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
+                </div>
+            </div>
         </div>
 
         <div id="jump-section" style="display:none; margin-top:14px;">
@@ -2569,10 +2856,83 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
         </div>
     </div>
 
+    <div id="tab-screen" style="display:none;">
+        <h2 style="color:#4fc3f7; margin-bottom:4px;">Screen Odds Tracker</h2>
+        <p style="font-size:12px; color:#888; margin-bottom:14px;">
+            Capture decimal odds from a betting feed. Mark the scoreboard region, tag home/away odds, then track live.
+        </p>
+
+        <div style="display:flex; gap:6px; align-items:center; margin-bottom:10px;">
+            <span id="st-stream-fps" style="font-size:11px; color:#444; margin-right:6px;"></span>
+            <button class="btn" id="st-stream-toggle" onclick="stToggleStream()" style="padding:5px 14px;font-size:12px;background:#333;">
+                Start Live View</button>
+            <span id="st-tracker-status" style="font-size:12px; color:#666;">Stopped</span>
+            <button class="btn btn-primary" id="st-tracker-toggle" onclick="stToggleTracker()" style="padding:5px 14px;font-size:12px;">Start Tracking</button>
+            <button class="btn" onclick="stReset()" style="padding:5px 10px;font-size:11px;background:#333;color:#ffab40;">Reset</button>
+        </div>
+
+        <p style="font-size:11px; color:#666; margin:6px 0 8px;">
+            <b>Step 1:</b> Click "Mark Scoreboard" then draw a box around the odds area. Scroll to zoom, drag to pan.
+        </p>
+        <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
+            <button class="btn st-region-btn" id="st-rgn-btn-scoreboard" onclick="stSetRegionMode('scoreboard')"
+                    style="padding:4px 12px;font-size:11px;background:#333;border:1px solid #555;">Mark Scoreboard</button>
+            <button class="btn" onclick="stClearRegions()" style="padding:4px 10px;font-size:11px;background:#333;color:#ef5350;">Clear All</button>
+            <span id="st-zoom-level" style="font-size:11px; color:#666; margin-left:auto;"></span>
+            <button class="btn" onclick="stZoomIn()" style="padding:2px 8px;font-size:13px;background:#333;">+</button>
+            <button class="btn" onclick="stZoomOut()" style="padding:2px 8px;font-size:13px;background:#333;">−</button>
+            <button class="btn" onclick="stZoomReset()" style="padding:2px 8px;font-size:11px;background:#333;">1:1</button>
+        </div>
+
+        <div id="st-screenshot-container" style="position:relative; max-width:100%; overflow:hidden;
+             border:1px solid #333; border-radius:4px; height:350px; background:#111;">
+            <span id="st-stream-placeholder" style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+                  color:#555; font-size:13px; z-index:1; pointer-events:none;">Click "Start Live View" or "Mark Scoreboard" to begin</span>
+            <div id="st-screen-inner" style="transform-origin:0 0; position:relative; width:100%;">
+                <img id="st-screen-img" style="display:none; width:100%;">
+                <canvas id="st-screen-canvas" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
+            </div>
+        </div>
+
+        <div id="st-sb-section" style="display:none; margin-top:12px;">
+            <p style="font-size:11px; color:#666; margin:0 0 8px;">
+                <b>Step 2:</b> Draw boxes on the scoreboard preview to tag each odds region.
+            </p>
+            <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center; flex-wrap:wrap;">
+                <button class="btn st-sub-btn" id="st-sub-btn-home_odds" onclick="stSetSubMode('home_odds')"
+                        style="padding:4px 10px;font-size:11px;background:#333;border:1px solid #555;">Home Odds</button>
+                <button class="btn st-sub-btn" id="st-sub-btn-away_odds" onclick="stSetSubMode('away_odds')"
+                        style="padding:4px 10px;font-size:11px;background:#333;border:1px solid #555;">Away Odds</button>
+                <button class="btn" onclick="stTestOCR()" style="padding:4px 10px;font-size:11px;background:#555;">Test OCR</button>
+            </div>
+            <div id="st-region-previews" style="display:flex; gap:10px; margin-bottom:8px; flex-wrap:wrap;"></div>
+            <div id="st-sb-preview" style="position:relative; border:1px solid #4fc3f7; border-radius:4px;
+                 background:#111; overflow:hidden; cursor:crosshair;">
+                <img id="st-sb-img" style="display:block; width:100%;">
+                <canvas id="st-sb-canvas" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
+            </div>
+        </div>
+
+        <div id="st-tracker-live" style="display:none; margin-top:10px; padding:10px; background:#111; border-radius:4px;">
+            <div style="display:flex; gap:20px; align-items:center; font-size:14px;">
+                <span>Home: <b id="st-ocr-home" style="color:#4caf50;">—</b></span>
+                <span>Away: <b id="st-ocr-away" style="color:#ef5350;">—</b></span>
+                <span id="st-ocr-conf" style="font-size:11px; color:#666;"></span>
+            </div>
+        </div>
+
+        <div id="st-history-section" style="margin-top:16px;">
+            <h3 style="color:#aaa; font-size:13px; margin-bottom:8px;">Odds History</h3>
+            <div id="st-history-log" style="max-height:300px; overflow-y:auto; font-family:'SF Mono','Menlo',monospace;
+                 font-size:12px; color:#aaa; background:#0a0a0a; border-radius:4px; padding:8px;"></div>
+        </div>
+    </div>
+
 <script>
 let currentGame = null;
 let mapResults = [0, 0, 0, 0, 0];
 let homeRounds = 0, awayRounds = 0;
+let homeAlive = 5, awayAlive = 5;
 let homeFair = 50;
 let obInterval = null;
 let autoRepricing = false;
@@ -2613,20 +2973,25 @@ function onGameSelect() {
         homeProb: parseFloat(opt.dataset.homeProb),
         tickers: JSON.parse(opt.dataset.tickers || '[]'),
         ouTickers: JSON.parse(opt.dataset.ouTickers || '[]'),
+        polySeriesTickers: JSON.parse(opt.dataset.polySeries || '[]'),
     };
     mapResults = [0, 0, 0, 0, 0];
     homeRounds = 0;
     awayRounds = 0;
     document.getElementById('home-rounds').textContent = '0';
     document.getElementById('away-rounds').textContent = '0';
+    resetAlive();
     onBestOfChange();
 
     document.getElementById('home-label').textContent = home;
     document.getElementById('away-label').textContent = away;
     document.getElementById('round-home-label').textContent = home;
     document.getElementById('round-away-label').textContent = away;
+    document.getElementById('alive-home-label').textContent = home;
+    document.getElementById('alive-away-label').textContent = away;
     const ctSel = document.getElementById('ct-team-select');
     ctSel.innerHTML = '<option value="home">'+home+'</option><option value="away">'+away+'</option>';
+    document.getElementById('map-select').value = '';
     document.getElementById('ct-win-pct').value = '';
     document.getElementById('t-win-pct').value = '';
     document.getElementById('half-label').textContent = '';
@@ -2644,11 +3009,13 @@ function onGameSelect() {
     ffPopulateTeams();
 
     const hasTickers = currentGame.tickers.length > 0;
-    document.getElementById('orderbook-section').style.display = hasTickers ? 'block' : 'none';
+    const hasPoly = currentGame.polySeriesTickers.length > 0;
+    const hasAny = hasTickers || hasPoly;
+    document.getElementById('orderbook-section').style.display = hasAny ? 'block' : 'none';
     document.getElementById('manual-section').style.display = hasTickers ? 'block' : 'none';
     document.getElementById('jump-section').style.display = hasTickers ? 'block' : 'none';
     document.getElementById('trade-match-content').style.display = 'block';
-    if (hasTickers) startOB(); else stopOB();
+    if (hasAny) startOB(); else stopOB();
 
     const hasOUTickers = currentGame.ouTickers.length > 0;
     document.getElementById('ou-orderbook-section').style.display = hasOUTickers ? 'block' : 'none';
@@ -2744,6 +3111,54 @@ function adjRounds(who, delta) {
     else awayRounds = Math.max(0, Math.min(30, awayRounds + delta));
     document.getElementById('home-rounds').textContent = homeRounds;
     document.getElementById('away-rounds').textContent = awayRounds;
+    if (delta > 0) resetAlive();
+    computeFair();
+    ouComputeFair();
+}
+
+const MAP_CT_RATES = {mirage:55, nuke:57, inferno:53, ancient:54, anubis:52, dust2:51, vertigo:54, train:53};
+function onMapSelect() {
+    const map = document.getElementById('map-select').value;
+    if (map && MAP_CT_RATES[map]) {
+        document.getElementById('ct-win-pct').value = MAP_CT_RATES[map];
+        document.getElementById('t-win-pct').value = 100 - MAP_CT_RATES[map];
+    }
+    computeFair();
+    ouComputeFair();
+}
+
+function adjAlive(who, delta) {
+    if (who === 'home') homeAlive = Math.max(0, Math.min(5, homeAlive + delta));
+    else awayAlive = Math.max(0, Math.min(5, awayAlive + delta));
+    document.getElementById('home-alive').textContent = homeAlive;
+    document.getElementById('away-alive').textContent = awayAlive;
+    computeFair();
+    ouComputeFair();
+}
+
+function resetAlive() {
+    homeAlive = 5; awayAlive = 5;
+    document.getElementById('home-alive').textContent = '5';
+    document.getElementById('away-alive').textContent = '5';
+}
+
+function onMoneyInput(who) {
+    const money = parseInt(document.getElementById(who + '-money').value);
+    if (!money && money !== 0) return;
+    const avg = money / 5;
+    const ctTeam = document.getElementById('ct-team-select').value;
+    const side = (who === ctTeam) ? 'ct' : 't';
+    const threshold = side === 't' ? 3700 : 3900;
+    let buy = 'eco';
+    if (avg >= threshold) buy = 'full';
+    else if (avg >= 2400) buy = 'force';
+    document.getElementById(who + '-buy').value = buy;
+    computeFair();
+    ouComputeFair();
+}
+
+function onBuyChange(who) {
+    document.getElementById(who + '-money').value = '';
     computeFair();
     ouComputeFair();
 }
@@ -2810,12 +3225,17 @@ function getState() {
         contracts: parseInt(document.getElementById('contracts').value),
         spread_cents: parseInt(document.getElementById('spread-cents').value),
         tickers: currentGame.tickers,
+        poly_tickers: currentGame.polySeriesTickers,
         best_of: bestOf,
         home_is_ct: homeIsCt,
         ct_win_pct: ctPct ? parseInt(ctPct) : null,
         t_win_pct: tPct ? parseInt(tPct) : null,
         home_buy: document.getElementById('home-buy').value || null,
         away_buy: document.getElementById('away-buy').value || null,
+        home_money: parseInt(document.getElementById('home-money').value) || null,
+        away_money: parseInt(document.getElementById('away-money').value) || null,
+        home_alive: homeAlive,
+        away_alive: awayAlive,
     };
 }
 
@@ -2890,6 +3310,7 @@ async function computeFair() {
                 (e.home_round_p * 100).toFixed(1) + '% round' +
                 (e.phase === 'round_over' ? ' (next)' : e.phase === 'buy_phase' ? ' (buying)' : '') + bombTag + timerStr;
             econDiv.style.display = 'flex';
+
         } else {
             econDiv.style.display = 'none';
         }
@@ -3060,19 +3481,98 @@ async function cancelRepost() {
 async function cancelAll() {
     showLoading();
     try {
+        const promises = [];
         const tickers = currentGame ? currentGame.tickers : [];
-        const resp = await fetch('/api/cancel_all', {
+        promises.push(fetch('/api/cancel_all', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({tickers}),
-        });
-        const data = await resp.json();
+        }).then(r => r.json()));
+        if (currentGame && currentGame.polySeriesTickers && currentGame.polySeriesTickers.length) {
+            const tokenIds = [];
+            for (const t of currentGame.polySeriesTickers) { tokenIds.push(t.token_a); tokenIds.push(t.token_b); }
+            promises.push(fetch('/api/poly_cancel_all', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({token_ids: tokenIds}),
+            }).then(r => r.json()));
+        }
+        const results = await Promise.all(promises);
+        const msgs = results.map(r => r.message).filter(Boolean).join(' | ');
         document.getElementById('results').innerHTML =
-            '<div class="alert alert-success">' + data.message + '</div>';
+            '<div class="alert alert-success">' + (msgs || 'Cancelled') + '</div>';
     } catch(e) {
         document.getElementById('results').innerHTML =
             '<div class="alert alert-error">Error: ' + e.message + '</div>';
     }
     hideLoading();
+}
+
+// ── Auto-Trade ──
+let autoTrading = false;
+let autoTradeInterval = null;
+let autoTradeBusy = false;
+
+function toggleAutoTrade() {
+    autoTrading ? stopAutoTrade() : startAutoTrade();
+}
+
+function startAutoTrade() {
+    if (!currentGame) { alert('Select a match first'); return; }
+    autoTrading = true;
+    autoTradeBusy = false;
+    const btn = document.getElementById('auto-trade-btn');
+    btn.textContent = 'STOP';
+    btn.style.background = '#b71c1c';
+    btn.style.color = '#ff5252';
+    btn.style.borderColor = '#ff5252';
+    autoTradeExecute();
+    autoTradeInterval = setInterval(autoTradeExecute, 3000);
+}
+
+async function stopAutoTrade() {
+    autoTrading = false;
+    autoTradeBusy = false;
+    if (autoTradeInterval) { clearInterval(autoTradeInterval); autoTradeInterval = null; }
+    const btn = document.getElementById('auto-trade-btn');
+    btn.textContent = 'AUTO TRADE';
+    btn.style.background = '#1b5e20';
+    btn.style.color = '#66bb6a';
+    btn.style.borderColor = '#66bb6a';
+    try {
+        const promises = [];
+        const tickers = currentGame ? currentGame.tickers : [];
+        promises.push(fetch('/api/cancel_all', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({tickers}),
+        }));
+        if (currentGame && currentGame.polySeriesTickers && currentGame.polySeriesTickers.length) {
+            const tokenIds = [];
+            for (const t of currentGame.polySeriesTickers) { tokenIds.push(t.token_a); tokenIds.push(t.token_b); }
+            promises.push(fetch('/api/poly_cancel_all', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({token_ids: tokenIds}),
+            }));
+        }
+        await Promise.all(promises);
+        document.getElementById('results').innerHTML =
+            '<div class="alert alert-success">Auto-trade stopped. All orders cancelled.</div>';
+    } catch(e) {}
+}
+
+async function autoTradeExecute() {
+    if (!autoTrading || !currentGame || autoTradeBusy) return;
+    autoTradeBusy = true;
+    try {
+        const resp = await fetch('/api/auto_trade', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(getState()),
+        });
+        const data = await resp.json();
+        renderResults(data);
+        if (data.home_fair !== undefined) {
+            homeFair = data.home_fair;
+        }
+    } catch(e) {}
+    autoTradeBusy = false;
 }
 
 async function jumpBid() {
@@ -3122,14 +3622,28 @@ function startOB() { stopOB(); fetchOB(); obInterval = setInterval(fetchOB, 3000
 function stopOB() { if (obInterval) { clearInterval(obInterval); obInterval = null; } }
 
 async function fetchOB() {
-    if (!currentGame || !currentGame.tickers.length) return;
+    if (!currentGame) return;
+    const hasKalshi = currentGame.tickers.length > 0;
+    const hasPoly = currentGame.polySeriesTickers && currentGame.polySeriesTickers.length > 0;
+    if (!hasKalshi && !hasPoly) return;
     try {
-        const resp = await fetch('/api/orderbook', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({tickers: currentGame.tickers}),
-        });
-        const data = await resp.json();
-        renderOB(data.books);
+        const promises = [];
+        if (hasKalshi) {
+            promises.push(fetch('/api/orderbook', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tickers: currentGame.tickers}),
+            }).then(r => r.json()));
+        }
+        if (hasPoly) {
+            promises.push(fetch('/api/poly_orderbook', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({poly_tickers: currentGame.polySeriesTickers}),
+            }).then(r => r.json()));
+        }
+        const results = await Promise.all(promises);
+        let allBooks = [];
+        for (const r of results) { if (r.books) allBooks = allBooks.concat(r.books); }
+        renderOB(allBooks);
         document.getElementById('ob-last-update').textContent =
             new Date().toLocaleTimeString();
     } catch(e) {}
@@ -3807,6 +4321,7 @@ document.addEventListener('keydown', function(e) {
         else if (key === 'X') stopAutoReprice();
         else if (key === 'J') jumpBid();
         else if (key === 'B') manualBuy();
+        else if (key === 'A') toggleAutoTrade();
     }
 });
 
@@ -3819,6 +4334,7 @@ function switchTab(tab) {
     document.getElementById('tab-bracket').style.display = tab === 'bracket' ? '' : 'none';
     document.getElementById('tab-futures').style.display = tab === 'futures' ? '' : 'none';
     document.getElementById('tab-forfeit').style.display = tab === 'forfeit' ? '' : 'none';
+    document.getElementById('tab-screen').style.display = tab === 'screen' ? '' : 'none';
     const showMatch = (tab === 'trade' || tab === 'ou-trade' || tab === 'forfeit');
     document.getElementById('match-state').style.display = showMatch ? 'block' : 'none';
     document.querySelectorAll('.tab-bar .tab').forEach(b => b.classList.remove('active'));
@@ -4154,7 +4670,7 @@ function brkPreset(key) {
     } else if (key === 'swiss') {
         swissMode = true;
         brkRounds = [];
-        swissStages = [{label:'Stage 1', winsToAdv:3, lossesToElim:3, slots:[], midStage:false, matchBo:1, deciderBo:3}];
+        swissStages = [{label:'Stage 1', winsToAdv:3, lossesToElim:3, slots:[], midStage:false, matchBo:1, deciderBo:3, nextMatchups:[]}];
         const ct = Math.min(16, T.length);
         for (let i = 0; i < ct; i++) swissStages[0].slots.push({type:'team', team:T[i], wins:0, losses:0});
         document.getElementById('brk-bracket-area').style.display = 'none';
@@ -4209,6 +4725,7 @@ async function brkSimulate() {
                 mid_stage: st.midStage || false,
                 match_bo: st.matchBo || 1,
                 decider_bo: st.deciderBo || 3,
+                next_matchups: (st.nextMatchups || []).map(m => ({team1: m.team1, team2: m.team2})),
                 slots: st.slots.map(s => s.type === 'advance' ? {type:'advance', stage:s.stage} : {type:'team', team:s.team, wins:s.wins||0, losses:s.losses||0}),
             })),
             sims,
@@ -4353,7 +4870,7 @@ function brkRenderResults(data) {
 
 function swissAddStage() {
     const idx = swissStages.length;
-    swissStages.push({label:'Stage '+(idx+1), winsToAdv:3, lossesToElim:3, slots:[], midStage:false, matchBo:1, deciderBo:3});
+    swissStages.push({label:'Stage '+(idx+1), winsToAdv:3, lossesToElim:3, slots:[], midStage:false, matchBo:1, deciderBo:3, nextMatchups:[]});
     const ct = Math.min(16, BRK_ALL_TEAMS.length);
     for (let i = 0; i < ct; i++) swissStages[idx].slots.push({type:'team', team:BRK_ALL_TEAMS[i], wins:0, losses:0});
     swissRender();
@@ -4408,8 +4925,55 @@ function swissToggleMidStage(si) {
     swissStages[si].midStage = !swissStages[si].midStage;
     if (!swissStages[si].midStage) {
         for (const s of swissStages[si].slots) { s.wins = 0; s.losses = 0; }
+        swissStages[si].nextMatchups = [];
     }
     swissRender();
+}
+
+function swissGetActivePools(si) {
+    const st = swissStages[si];
+    const pools = {};
+    for (const s of st.slots) {
+        if (s.type !== 'team') continue;
+        if ((s.wins||0) >= st.winsToAdv || (s.losses||0) >= st.lossesToElim) continue;
+        const key = (s.wins||0)+'-'+(s.losses||0);
+        if (!pools[key]) pools[key] = [];
+        pools[key].push(s.team);
+    }
+    return pools;
+}
+
+function swissAutoMatchups(si) {
+    const pools = swissGetActivePools(si);
+    const matchups = [];
+    for (const key of Object.keys(pools).sort()) {
+        const pool = pools[key];
+        const half = Math.floor(pool.length / 2);
+        for (let i = 0; i < half; i++) {
+            matchups.push({team1: pool[i], team2: pool[pool.length - 1 - i]});
+        }
+    }
+    swissStages[si].nextMatchups = matchups;
+    swissRender();
+}
+
+function swissAddMatchup(si) {
+    const pools = swissGetActivePools(si);
+    const allActive = Object.values(pools).flat();
+    if (allActive.length < 2) return;
+    if (!swissStages[si].nextMatchups) swissStages[si].nextMatchups = [];
+    swissStages[si].nextMatchups.push({team1: allActive[0], team2: allActive[1]});
+    swissRender();
+}
+
+function swissRemoveMatchup(si, idx) {
+    swissStages[si].nextMatchups.splice(idx, 1);
+    swissRender();
+}
+
+function swissMatchupChange(si, idx, side, val) {
+    swissStages[si].nextMatchups[idx][side] = val;
+    brkAutosave();
 }
 
 function swissAddAdvancers(si) {
@@ -4490,6 +5054,44 @@ function swissRender() {
         }
         html += '</div>';
 
+        if (st.midStage) {
+            const matchups = st.nextMatchups || [];
+            const pools = swissGetActivePools(si);
+            const allActive = Object.values(pools).flat();
+            html += '<div style="margin-top:10px;padding:8px;background:#111;border:1px solid #333;border-radius:6px;">';
+            html += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">';
+            html += '<span style="color:#4fc3f7;font-size:12px;font-weight:bold;">Next Round Matchups</span>';
+            html += '<div style="display:flex;gap:4px;">';
+            html += '<button class="btn" onclick="swissAutoMatchups('+si+')" style="padding:2px 8px;font-size:10px;background:#1a1a2e;border-color:#4fc3f7;color:#4fc3f7;">Auto-pair by seed</button>';
+            html += '<button class="btn" onclick="swissAddMatchup('+si+')" style="padding:2px 8px;font-size:10px;background:#1a2e1a;border-color:#2e7d32;color:#81c784;">+ Add</button>';
+            html += '</div></div>';
+            if (matchups.length === 0) {
+                html += '<div style="color:#555;font-size:11px;padding:4px 0;">No matchups set — simulation will pair by seed. Click "Auto-pair" or add manually.</div>';
+            }
+            for (let mi = 0; mi < matchups.length; mi++) {
+                const mu = matchups[mi];
+                const rec1 = st.slots.find(s => s.type==='team' && s.team===mu.team1);
+                const rec2 = st.slots.find(s => s.type==='team' && s.team===mu.team2);
+                const tag1 = rec1 ? ' ('+(rec1.wins||0)+'-'+(rec1.losses||0)+')' : '';
+                const tag2 = rec2 ? ' ('+(rec2.wins||0)+'-'+(rec2.losses||0)+')' : '';
+                html += '<div style="display:flex;align-items:center;gap:6px;margin:3px 0;">';
+                html += '<select onchange="swissMatchupChange('+si+','+mi+',\\'team1\\',this.value)" style="flex:1;padding:3px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;font-size:11px;">';
+                for (const t of allActive) {
+                    html += '<option value="'+t+'"'+(mu.team1===t?' selected':'')+'>'+t+'</option>';
+                }
+                html += '</select>';
+                html += '<span style="color:#4fc3f7;font-size:11px;">vs</span>';
+                html += '<select onchange="swissMatchupChange('+si+','+mi+',\\'team2\\',this.value)" style="flex:1;padding:3px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;font-size:11px;">';
+                for (const t of allActive) {
+                    html += '<option value="'+t+'"'+(mu.team2===t?' selected':'')+'>'+t+'</option>';
+                }
+                html += '</select>';
+                html += '<button onclick="swissRemoveMatchup('+si+','+mi+')" style="background:none;border:none;color:#ef5350;cursor:pointer;font-size:14px;padding:0 4px;" title="Remove">&times;</button>';
+                html += '</div>';
+            }
+            html += '</div>';
+        }
+
         if (si > 0) {
             html += '<div class="swiss-add-adv">';
             html += '<select id="swiss-adv-src-'+si+'" style="background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;padding:3px 6px;">';
@@ -4518,6 +5120,7 @@ async function swissSimulate() {
         mid_stage: st.midStage || false,
         match_bo: st.matchBo || 1,
         decider_bo: st.deciderBo || 3,
+        next_matchups: (st.nextMatchups || []).map(m => ({team1: m.team1, team2: m.team2})),
         slots: st.slots.map(s => s.type === 'advance' ? {type:'advance', stage:s.stage} : {type:'team', team:s.team, wins:s.wins||0, losses:s.losses||0}),
     }));
 
@@ -4960,6 +5563,1045 @@ async function futuresRefreshAsks() {
         document.getElementById('futures-status').textContent = 'Error: ' + e.message;
     }
 }
+
+// ── Screen Tracker (Odds OCR) ─────────────────────────────
+let stScreenData = null;
+let stRegionMode = null;
+let stSubMode = null;
+let stScoreboard = null;
+let stSubRegions = {};
+let stDrawStart = null;
+let stSbDrawStart = null;
+let stTrackerPollInterval = null;
+let stStreamRunning = false;
+let stStreamRAF = null;
+let stStreamFetching = false;
+let stStreamFrameCount = 0;
+let stStreamLastFpsTime = 0;
+let stSbPreviewInterval = null;
+let stTrackerRunning = false;
+let stLastHome = null;
+let stLastAway = null;
+
+let stZoom = 1;
+let stPanX = 0, stPanY = 0;
+let stIsPanning = false;
+let stPanLast = null;
+
+const ST_REGION_COLORS = {home_odds: '#4caf50', away_odds: '#ef5350'};
+const ST_REGION_LABELS = {home_odds: 'Home', away_odds: 'Away'};
+
+function stUpdateTransform() {
+    const inner = document.getElementById('st-screen-inner');
+    if (inner) inner.style.transform = 'scale(' + stZoom + ') translate(' + stPanX + 'px,' + stPanY + 'px)';
+    const el = document.getElementById('st-zoom-level');
+    if (el) el.textContent = stZoom > 1 ? stZoom.toFixed(1) + 'x' : '';
+}
+
+function stZoomIn() { stZoom = Math.min(6, stZoom + 0.5); stUpdateTransform(); }
+function stZoomOut() { stZoom = Math.max(1, stZoom - 0.5); if (stZoom <= 1) { stZoom = 1; stPanX = 0; stPanY = 0; } stUpdateTransform(); }
+function stZoomReset() { stZoom = 1; stPanX = 0; stPanY = 0; stUpdateTransform(); }
+
+// ── Live view streaming ──
+async function stStreamFrame() {
+    if (!stStreamRunning || stStreamFetching) return;
+    stStreamFetching = true;
+    try {
+        const resp = await fetch('/api/st_screenshot', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({fast: true}),
+        });
+        const data = await resp.json();
+        if (data.error) { stStreamFetching = false; return; }
+        stScreenData = data;
+        const img = document.getElementById('st-screen-img');
+        img.src = 'data:image/' + (data.format || 'png') + ';base64,' + data.base64;
+        img.onload = () => {
+            img.style.display = 'block';
+            document.getElementById('st-stream-placeholder').style.display = 'none';
+            const canvas = document.getElementById('st-screen-canvas');
+            if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+            }
+            stRedrawCanvas();
+            stStreamFrameCount++;
+            const now = performance.now();
+            if (now - stStreamLastFpsTime > 2000) {
+                const fps = (stStreamFrameCount / ((now - stStreamLastFpsTime) / 1000)).toFixed(1);
+                document.getElementById('st-stream-fps').textContent = fps + ' fps';
+                stStreamFrameCount = 0;
+                stStreamLastFpsTime = now;
+            }
+        };
+    } catch(e) {}
+    stStreamFetching = false;
+    if (stStreamRunning) {
+        stStreamRAF = setTimeout(stStreamFrame, 0);
+    }
+}
+
+function stToggleStream() {
+    if (stStreamRunning) {
+        stStreamRunning = false;
+        if (stStreamRAF) { clearTimeout(stStreamRAF); stStreamRAF = null; }
+        document.getElementById('st-stream-toggle').textContent = 'Start Live View';
+        document.getElementById('st-stream-toggle').style.background = '#333';
+        document.getElementById('st-stream-toggle').style.color = '';
+        document.getElementById('st-stream-fps').textContent = '';
+    } else {
+        stStreamRunning = true;
+        stStreamLastFpsTime = performance.now();
+        stStreamFrameCount = 0;
+        document.getElementById('st-stream-toggle').textContent = 'Stop Live View';
+        document.getElementById('st-stream-toggle').style.background = '#66bb6a';
+        document.getElementById('st-stream-toggle').style.color = '#000';
+        stStreamFrame();
+    }
+}
+
+// ── Step 1: Mark scoreboard on live view ──
+function stSetRegionMode(mode) {
+    if (!stStreamRunning) stToggleStream();
+    stRegionMode = mode;
+    document.querySelectorAll('.st-region-btn').forEach(b => {
+        b.style.background = '#333'; b.style.color = '#e0e0e0'; b.style.borderColor = '#555';
+    });
+    const btn = document.getElementById('st-rgn-btn-' + mode);
+    if (btn) {
+        btn.style.background = '#4fc3f7'; btn.style.color = '#000'; btn.style.borderColor = '#4fc3f7';
+    }
+    const container = document.getElementById('st-screenshot-container');
+    if (container) container.style.cursor = 'crosshair';
+}
+
+function stClearRegions() {
+    stScoreboard = null;
+    stSubRegions = {};
+    stRegionMode = null;
+    stSubMode = null;
+    document.querySelectorAll('.st-region-btn').forEach(b => {
+        b.style.background = '#333'; b.style.color = '#e0e0e0'; b.style.borderColor = '#555';
+    });
+    fetch('/api/st_clear_regions', {method: 'POST'});
+    const canvas = document.getElementById('st-screen-canvas');
+    if (canvas) { canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); }
+    document.getElementById('st-sb-section').style.display = 'none';
+    if (stSbPreviewInterval) { clearInterval(stSbPreviewInterval); stSbPreviewInterval = null; }
+    document.getElementById('st-region-previews').innerHTML = '';
+}
+
+// ── Canvas drawing ──
+function stRedrawCanvas() {
+    const canvas = document.getElementById('st-screen-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!stScreenData) return;
+    const scaleX = canvas.width / stScreenData.width;
+    const scaleY = canvas.height / stScreenData.height;
+    if (stScoreboard) {
+        ctx.strokeStyle = '#4fc3f7';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(stScoreboard.x * scaleX, stScoreboard.y * scaleY,
+                       stScoreboard.w * scaleX, stScoreboard.h * scaleY);
+        ctx.fillStyle = '#4fc3f7';
+        ctx.font = '12px monospace';
+        ctx.fillText('Odds Region', stScoreboard.x * scaleX + 2, stScoreboard.y * scaleY - 4);
+    }
+    if (stDrawStart && stRegionMode) {
+        ctx.strokeStyle = '#4fc3f7';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(stDrawStart.sx, stDrawStart.sy, stDrawStart.dx || 0, stDrawStart.dy || 0);
+        ctx.setLineDash([]);
+    }
+}
+
+function stGetCanvasCoords(e, canvasId) {
+    const canvas = document.getElementById(canvasId || 'st-screen-canvas');
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return {x: 0, y: 0};
+    return {
+        x: (e.clientX - rect.left) * (canvas.width / rect.width),
+        y: (e.clientY - rect.top) * (canvas.height / rect.height),
+    };
+}
+
+// Live view mouse handlers
+(function() {
+    const container = document.getElementById('st-screenshot-container');
+    if (!container) return;
+
+    container.addEventListener('wheel', function(e) {
+        e.preventDefault();
+        const delta = e.deltaY > 0 ? -0.3 : 0.3;
+        stZoom = Math.max(1, Math.min(6, stZoom + delta));
+        if (stZoom <= 1) { stZoom = 1; stPanX = 0; stPanY = 0; }
+        stUpdateTransform();
+    }, {passive: false});
+
+    container.addEventListener('mousedown', function(e) {
+        if (!stScreenData) return;
+        e.preventDefault();
+        if (stRegionMode === 'scoreboard') {
+            const c = stGetCanvasCoords(e);
+            stDrawStart = {sx: c.x, sy: c.y, dx: 0, dy: 0};
+        } else {
+            stIsPanning = true;
+            stPanLast = {x: e.clientX, y: e.clientY};
+            container.style.cursor = 'grabbing';
+        }
+    });
+
+    container.addEventListener('mousemove', function(e) {
+        if (stDrawStart) {
+            const c = stGetCanvasCoords(e);
+            stDrawStart.dx = c.x - stDrawStart.sx;
+            stDrawStart.dy = c.y - stDrawStart.sy;
+            stRedrawCanvas();
+        } else if (stIsPanning && stPanLast) {
+            const dx = (e.clientX - stPanLast.x) / stZoom;
+            const dy = (e.clientY - stPanLast.y) / stZoom;
+            stPanX += dx;
+            stPanY += dy;
+            stPanLast = {x: e.clientX, y: e.clientY};
+            stUpdateTransform();
+        }
+    });
+
+    container.addEventListener('mouseup', function(e) {
+        if (stIsPanning) {
+            stIsPanning = false;
+            stPanLast = null;
+            container.style.cursor = stRegionMode ? 'crosshair' : (stZoom > 1 ? 'grab' : 'default');
+            return;
+        }
+        if (!stDrawStart || stRegionMode !== 'scoreboard' || !stScreenData) return;
+        const canvas = document.getElementById('st-screen-canvas');
+        const c = stGetCanvasCoords(e);
+        let x1 = stDrawStart.sx, y1 = stDrawStart.sy;
+        let x2 = c.x, y2 = c.y;
+        if (Math.abs(x2 - x1) < 10 || Math.abs(y2 - y1) < 10) { stDrawStart = null; return; }
+        const scaleX = stScreenData.width / canvas.width;
+        const scaleY = stScreenData.height / canvas.height;
+        stScoreboard = {
+            x: Math.round(Math.min(x1, x2) * scaleX),
+            y: Math.round(Math.min(y1, y2) * scaleY),
+            w: Math.round(Math.abs(x2 - x1) * scaleX),
+            h: Math.round(Math.abs(y2 - y1) * scaleY),
+        };
+        stDrawStart = null;
+        stRegionMode = null;
+        const btn = document.getElementById('st-rgn-btn-scoreboard');
+        if (btn) { btn.style.background = '#1b3a2e'; btn.style.color = '#66bb6a'; btn.style.borderColor = '#66bb6a'; }
+        container.style.cursor = stZoom > 1 ? 'grab' : 'default';
+        stRedrawCanvas();
+
+        fetch('/api/st_set_scoreboard', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(stScoreboard),
+        });
+
+        stShowSbPreview();
+    });
+
+    container.addEventListener('mouseleave', function() {
+        if (stIsPanning) {
+            stIsPanning = false;
+            stPanLast = null;
+            container.style.cursor = stRegionMode ? 'crosshair' : (stZoom > 1 ? 'grab' : 'default');
+        }
+    });
+})();
+
+// ── Step 2: Scoreboard preview + sub-region tagging ──
+function stShowSbPreview() {
+    document.getElementById('st-sb-section').style.display = 'block';
+    stRefreshSbPreview();
+    if (stSbPreviewInterval) clearInterval(stSbPreviewInterval);
+    stSbPreviewInterval = setInterval(stRefreshSbPreview, 150);
+}
+
+async function stRefreshSbPreview() {
+    try {
+        const resp = await fetch('/api/st_scoreboard_capture', {method: 'POST'});
+        const data = await resp.json();
+        if (data.error) return;
+        const img = document.getElementById('st-sb-img');
+        img.src = 'data:image/jpeg;base64,' + data.base64;
+        img.onload = () => {
+            const canvas = document.getElementById('st-sb-canvas');
+            if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+            }
+            stRedrawSbCanvas();
+        };
+    } catch(e) {}
+}
+
+function stSetSubMode(mode) {
+    stSubMode = mode;
+    document.querySelectorAll('.st-sub-btn').forEach(b => {
+        b.style.background = '#333'; b.style.borderColor = '#555'; b.style.color = '#e0e0e0';
+    });
+    const btn = document.getElementById('st-sub-btn-' + mode);
+    if (btn) {
+        const color = ST_REGION_COLORS[mode] || '#fff';
+        btn.style.background = color; btn.style.color = '#000'; btn.style.borderColor = color;
+    }
+    const preview = document.getElementById('st-sb-preview');
+    if (preview) preview.style.cursor = 'crosshair';
+}
+
+function stRedrawSbCanvas() {
+    const canvas = document.getElementById('st-sb-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const img = document.getElementById('st-sb-img');
+    if (!img || !img.naturalWidth || !stScoreboard) return;
+    for (const [key, r] of Object.entries(stSubRegions)) {
+        const scaleX = canvas.width / stScoreboard.w;
+        const scaleY = canvas.height / stScoreboard.h;
+        const color = ST_REGION_COLORS[key] || '#fff';
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(r.x * scaleX, r.y * scaleY, r.w * scaleX, r.h * scaleY);
+        ctx.fillStyle = color;
+        ctx.font = '12px monospace';
+        ctx.fillText(ST_REGION_LABELS[key] || key, r.x * scaleX + 2, r.y * scaleY - 4);
+    }
+    if (stSbDrawStart && stSubMode) {
+        ctx.strokeStyle = ST_REGION_COLORS[stSubMode] || '#fff';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(stSbDrawStart.sx, stSbDrawStart.sy, stSbDrawStart.dx || 0, stSbDrawStart.dy || 0);
+        ctx.setLineDash([]);
+    }
+}
+
+// Scoreboard preview mouse handlers
+(function() {
+    const preview = document.getElementById('st-sb-preview');
+    if (!preview) return;
+
+    preview.addEventListener('mousedown', function(e) {
+        if (!stSubMode) return;
+        e.preventDefault();
+        const c = stGetCanvasCoords(e, 'st-sb-canvas');
+        stSbDrawStart = {sx: c.x, sy: c.y, dx: 0, dy: 0};
+    });
+
+    preview.addEventListener('mousemove', function(e) {
+        if (!stSbDrawStart) return;
+        const c = stGetCanvasCoords(e, 'st-sb-canvas');
+        stSbDrawStart.dx = c.x - stSbDrawStart.sx;
+        stSbDrawStart.dy = c.y - stSbDrawStart.sy;
+        stRedrawSbCanvas();
+    });
+
+    preview.addEventListener('mouseup', function(e) {
+        if (!stSbDrawStart || !stSubMode || !stScoreboard) return;
+        const canvas = document.getElementById('st-sb-canvas');
+        const c = stGetCanvasCoords(e, 'st-sb-canvas');
+        let x1 = stSbDrawStart.sx, y1 = stSbDrawStart.sy;
+        let x2 = c.x, y2 = c.y;
+        if (Math.abs(x2 - x1) < 3 || Math.abs(y2 - y1) < 3) { stSbDrawStart = null; return; }
+
+        const scaleX = stScoreboard.w / canvas.width;
+        const scaleY = stScoreboard.h / canvas.height;
+        const region = {
+            x: Math.round(Math.min(x1, x2) * scaleX),
+            y: Math.round(Math.min(y1, y2) * scaleY),
+            w: Math.round(Math.abs(x2 - x1) * scaleX),
+            h: Math.round(Math.abs(y2 - y1) * scaleY),
+        };
+        stSubRegions[stSubMode] = region;
+        stSbDrawStart = null;
+        stRedrawSbCanvas();
+
+        fetch('/api/st_set_sub_region', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: stSubMode, region: region}),
+        });
+
+        const order = ['home_odds', 'away_odds'];
+        const nextIdx = order.indexOf(stSubMode) + 1;
+        if (nextIdx < order.length && !stSubRegions[order[nextIdx]]) {
+            stSetSubMode(order[nextIdx]);
+        } else {
+            stSubMode = null;
+            document.querySelectorAll('.st-sub-btn').forEach(b => {
+                b.style.background = '#333'; b.style.color = '#e0e0e0'; b.style.borderColor = '#555';
+            });
+            preview.style.cursor = 'crosshair';
+        }
+        stUpdateRegionPreviews();
+    });
+})();
+
+function stUpdateRegionPreviews() {
+    const previews = document.getElementById('st-region-previews');
+    let html = '';
+    for (const key of ['home_odds', 'away_odds']) {
+        const color = ST_REGION_COLORS[key];
+        const label = ST_REGION_LABELS[key];
+        const r = stSubRegions[key];
+        if (r) {
+            html += '<span style="font-size:11px;color:' + color + ';background:#1a1a2e;padding:2px 6px;border-radius:3px;">' +
+                label + ': ' + r.x + ',' + r.y + ' ' + r.w + 'x' + r.h + '</span> ';
+        }
+    }
+    previews.innerHTML = html;
+}
+
+async function stTestOCR() {
+    const previews = document.getElementById('st-region-previews');
+    previews.innerHTML = '<span style="color:#666;font-size:12px;">Testing OCR...</span>';
+    try {
+        const resp = await fetch('/api/st_capture_once', {method: 'POST'});
+        const data = await resp.json();
+        const odds = data.odds || {};
+        let html = '';
+        for (const key of ['home_odds', 'away_odds']) {
+            const color = ST_REGION_COLORS[key];
+            const label = ST_REGION_LABELS[key];
+            const val = odds[key] != null ? odds[key] : '?';
+            html += '<div style="text-align:center;margin-right:12px;">';
+            html += '<div style="font-size:11px;color:' + color + ';font-weight:600;">' + label + '</div>';
+            html += '<div style="font-size:16px;font-weight:700;color:#fff;">' + val + '</div>';
+            html += '</div>';
+        }
+        if (data.confidence) {
+            const confParts = Object.entries(data.confidence).map(([k,v]) => k + ':' + v);
+            html += '<div style="font-size:11px;color:#666;margin-top:4px;">' + confParts.join('  ') + '</div>';
+        }
+        previews.innerHTML = html;
+    } catch(e) {
+        previews.innerHTML = '<span style="color:#ef5350;font-size:12px;">Error: ' + e.message + '</span>';
+    }
+}
+
+function stToggleTracker() {
+    if (stTrackerRunning) {
+        fetch('/api/st_stop', {method: 'POST'});
+        clearInterval(stTrackerPollInterval);
+        stTrackerRunning = false;
+        document.getElementById('st-tracker-toggle').textContent = 'Start Tracking';
+        document.getElementById('st-tracker-status').textContent = 'Stopped';
+        document.getElementById('st-tracker-status').style.color = '#666';
+        document.getElementById('st-tracker-live').style.display = 'none';
+    } else {
+        fetch('/api/st_start', {method: 'POST'});
+        stTrackerRunning = true;
+        document.getElementById('st-tracker-toggle').textContent = 'Stop Tracking';
+        document.getElementById('st-tracker-status').textContent = 'Running';
+        document.getElementById('st-tracker-status').style.color = '#4caf50';
+        document.getElementById('st-tracker-live').style.display = '';
+        stTrackerPollInterval = setInterval(stPollState, 200);
+    }
+}
+
+async function stPollState() {
+    try {
+        const resp = await fetch('/api/st_state');
+        const s = await resp.json();
+        const odds = s.odds || {};
+        const ho = odds.home_odds != null ? odds.home_odds : null;
+        const ao = odds.away_odds != null ? odds.away_odds : null;
+        const homeEl = document.getElementById('st-ocr-home');
+        const awayEl = document.getElementById('st-ocr-away');
+        homeEl.textContent = ho !== null ? ho.toFixed(2) : '—';
+        awayEl.textContent = ao !== null ? ao.toFixed(2) : '—';
+
+        if (s.confidence) {
+            const confParts = Object.entries(s.confidence).map(([k,v]) => k + ':' + v);
+            document.getElementById('st-ocr-conf').textContent = confParts.join('  ');
+        }
+
+        if (stLastHome !== null && ho !== null) {
+            const diff = Math.abs(ho - stLastHome);
+            homeEl.style.color = diff >= 0.20 ? '#ff5722' : '#4caf50';
+        }
+        if (stLastAway !== null && ao !== null) {
+            const diff = Math.abs(ao - stLastAway);
+            awayEl.style.color = diff >= 0.20 ? '#ff5722' : '#ef5350';
+        }
+        if (ho !== null) stLastHome = ho;
+        if (ao !== null) stLastAway = ao;
+
+        const histResp = await fetch('/api/st_history');
+        const hist = await histResp.json();
+        const log = document.getElementById('st-history-log');
+        let html = '';
+        for (let i = hist.length - 1; i >= Math.max(0, hist.length - 50); i--) {
+            const h = hist[i];
+            const ts = new Date(h.ts * 1000).toLocaleTimeString();
+            const ho2 = (h.odds || {}).home_odds;
+            const ao2 = (h.odds || {}).away_odds;
+            const hv = ho2 != null ? ho2.toFixed(2) : '—';
+            const av = ao2 != null ? ao2.toFixed(2) : '—';
+            html += '<div>' + ts + '  Home: <span style="color:#4caf50;">' + hv +
+                    '</span>  Away: <span style="color:#ef5350;">' + av + '</span></div>';
+        }
+        log.innerHTML = html;
+    } catch(e) {}
+}
+
+function stReset() {
+    fetch('/api/st_reset', {method: 'POST'});
+    stLastHome = null;
+    stLastAway = null;
+    document.getElementById('st-ocr-home').textContent = '—';
+    document.getElementById('st-ocr-away').textContent = '—';
+    document.getElementById('st-history-log').innerHTML = '';
+}
+
+// ── Screen Trade (in Trade tab) ─────────────────────────────
+let sctScreenData = null;
+let sctStreamRunning = false;
+let sctStreamRAF = null;
+let sctStreamFetching = false;
+let sctStreamFrameCount = 0;
+let sctStreamLastFpsTime = 0;
+let sctScoreboard = null;
+let sctSubRegions = {};
+let sctRegionMode = null;
+let sctSubMode = null;
+let sctDrawStart = null;
+let sctSbDrawStart = null;
+let sctSbPreviewInterval = null;
+let sctZoom = 1;
+let sctPanX = 0, sctPanY = 0;
+let sctIsPanning = false;
+let sctPanLast = null;
+
+let screenTrading = false;
+let screenTradePoll = null;
+
+let sctTrackedGames = {};
+
+function sctGameKey(g) { return g.home + '|' + g.away; }
+
+function sctUpdateTransform() {
+    const inner = document.getElementById('sct-screen-inner');
+    if (inner) inner.style.transform = 'scale(' + sctZoom + ') translate(' + sctPanX + 'px,' + sctPanY + 'px)';
+}
+
+function sctGetCanvasCoords(e, canvasId) {
+    const canvas = document.getElementById(canvasId || 'sct-screen-canvas');
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return {x: 0, y: 0};
+    return {
+        x: (e.clientX - rect.left) * (canvas.width / rect.width),
+        y: (e.clientY - rect.top) * (canvas.height / rect.height),
+    };
+}
+
+async function sctStreamFrame() {
+    if (!sctStreamRunning || sctStreamFetching) return;
+    sctStreamFetching = true;
+    try {
+        const resp = await fetch('/api/st_screenshot', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({fast: true}),
+        });
+        const data = await resp.json();
+        if (!data.error) {
+            sctScreenData = data;
+            const img = document.getElementById('sct-screen-img');
+            img.src = 'data:image/' + (data.format || 'png') + ';base64,' + data.base64;
+            img.onload = () => {
+                img.style.display = 'block';
+                const canvas = document.getElementById('sct-screen-canvas');
+                if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+                    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+                }
+                sctRedrawCanvas();
+                sctStreamFrameCount++;
+                const now = performance.now();
+                if (now - sctStreamLastFpsTime > 2000) {
+                    const fps = (sctStreamFrameCount / ((now - sctStreamLastFpsTime) / 1000)).toFixed(1);
+                    document.getElementById('sct-stream-fps').textContent = fps + ' fps';
+                    sctStreamFrameCount = 0; sctStreamLastFpsTime = now;
+                }
+            };
+        }
+    } catch(e) {}
+    sctStreamFetching = false;
+    if (sctStreamRunning) sctStreamRAF = setTimeout(sctStreamFrame, 0);
+}
+
+function sctToggleStream() {
+    const container = document.getElementById('sct-screenshot-container');
+    if (sctStreamRunning) {
+        sctStreamRunning = false;
+        if (sctStreamRAF) { clearTimeout(sctStreamRAF); sctStreamRAF = null; }
+        container.style.display = 'none';
+        document.getElementById('sct-stream-toggle').textContent = 'Live View';
+        document.getElementById('sct-stream-fps').textContent = '';
+    } else {
+        sctStreamRunning = true;
+        sctStreamLastFpsTime = performance.now(); sctStreamFrameCount = 0;
+        container.style.display = '';
+        document.getElementById('sct-stream-toggle').textContent = 'Hide View';
+        sctStreamFrame();
+    }
+}
+
+function sctSetRegionMode(mode) {
+    if (!sctStreamRunning) sctToggleStream();
+    sctRegionMode = mode;
+    document.querySelectorAll('.sct-region-btn').forEach(b => {
+        b.style.background = '#333'; b.style.color = '#e0e0e0'; b.style.borderColor = '#555';
+    });
+    const btn = document.getElementById('sct-rgn-btn-' + mode);
+    if (btn) { btn.style.background = '#7986cb'; btn.style.color = '#000'; btn.style.borderColor = '#7986cb'; }
+    document.getElementById('sct-screenshot-container').style.cursor = 'crosshair';
+}
+
+function sctRedrawCanvas() {
+    const canvas = document.getElementById('sct-screen-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!sctScreenData) return;
+    const sx = canvas.width / sctScreenData.width;
+    const sy = canvas.height / sctScreenData.height;
+    if (sctScoreboard) {
+        ctx.strokeStyle = '#7986cb'; ctx.lineWidth = 2;
+        ctx.strokeRect(sctScoreboard.x * sx, sctScoreboard.y * sy, sctScoreboard.w * sx, sctScoreboard.h * sy);
+        ctx.fillStyle = '#7986cb'; ctx.font = '12px monospace';
+        ctx.fillText('Odds Region', sctScoreboard.x * sx + 2, sctScoreboard.y * sy - 4);
+    }
+    if (sctDrawStart && sctRegionMode) {
+        ctx.strokeStyle = '#7986cb'; ctx.lineWidth = 2; ctx.setLineDash([4, 4]);
+        ctx.strokeRect(sctDrawStart.sx, sctDrawStart.sy, sctDrawStart.dx || 0, sctDrawStart.dy || 0);
+        ctx.setLineDash([]);
+    }
+}
+
+function sctClearAll() {
+    sctScoreboard = null; sctSubRegions = {};
+    sctRegionMode = null; sctSubMode = null;
+    sctTrackedGames = {};
+    fetch('/api/st_clear_regions', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({}),
+    });
+    const canvas = document.getElementById('sct-screen-canvas');
+    if (canvas) canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+    document.getElementById('sct-sb-section').style.display = 'none';
+    if (sctSbPreviewInterval) { clearInterval(sctSbPreviewInterval); sctSbPreviewInterval = null; }
+    sctRenderTrackedGames();
+    sctRenderMarkButtons();
+}
+
+(function() {
+    const container = document.getElementById('sct-screenshot-container');
+    if (!container) return;
+    container.addEventListener('wheel', function(e) {
+        e.preventDefault();
+        sctZoom = Math.max(1, Math.min(6, sctZoom + (e.deltaY > 0 ? -0.3 : 0.3)));
+        if (sctZoom <= 1) { sctZoom = 1; sctPanX = 0; sctPanY = 0; }
+        sctUpdateTransform();
+    }, {passive: false});
+    container.addEventListener('mousedown', function(e) {
+        if (!sctScreenData) return;
+        e.preventDefault();
+        if (sctRegionMode === 'scoreboard') {
+            sctDrawStart = sctGetCanvasCoords(e);
+            sctDrawStart = {sx: sctDrawStart.x, sy: sctDrawStart.y, dx: 0, dy: 0};
+        } else {
+            sctIsPanning = true; sctPanLast = {x: e.clientX, y: e.clientY};
+            container.style.cursor = 'grabbing';
+        }
+    });
+    container.addEventListener('mousemove', function(e) {
+        if (sctDrawStart) {
+            const c = sctGetCanvasCoords(e);
+            sctDrawStart.dx = c.x - sctDrawStart.sx; sctDrawStart.dy = c.y - sctDrawStart.sy;
+            sctRedrawCanvas();
+        } else if (sctIsPanning && sctPanLast) {
+            sctPanX += (e.clientX - sctPanLast.x) / sctZoom;
+            sctPanY += (e.clientY - sctPanLast.y) / sctZoom;
+            sctPanLast = {x: e.clientX, y: e.clientY}; sctUpdateTransform();
+        }
+    });
+    container.addEventListener('mouseup', function(e) {
+        if (sctIsPanning) { sctIsPanning = false; sctPanLast = null;
+            container.style.cursor = sctRegionMode ? 'crosshair' : 'default'; return; }
+        if (!sctDrawStart || sctRegionMode !== 'scoreboard' || !sctScreenData) return;
+        const canvas = document.getElementById('sct-screen-canvas');
+        const c = sctGetCanvasCoords(e);
+        let x1 = sctDrawStart.sx, y1 = sctDrawStart.sy, x2 = c.x, y2 = c.y;
+        if (Math.abs(x2-x1) < 10 || Math.abs(y2-y1) < 10) { sctDrawStart = null; return; }
+        const scX = sctScreenData.width / canvas.width, scY = sctScreenData.height / canvas.height;
+        sctScoreboard = {
+            x: Math.round(Math.min(x1,x2)*scX), y: Math.round(Math.min(y1,y2)*scY),
+            w: Math.round(Math.abs(x2-x1)*scX), h: Math.round(Math.abs(y2-y1)*scY),
+        };
+        sctDrawStart = null; sctRegionMode = null;
+        document.querySelectorAll('.sct-region-btn').forEach(b => {
+            b.style.background = '#333'; b.style.color = '#e0e0e0'; b.style.borderColor = '#555';
+        });
+        container.style.cursor = 'default';
+        sctRedrawCanvas();
+        fetch('/api/st_set_scoreboard', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(sctScoreboard),
+        });
+        sctShowSbPreview();
+    });
+    container.addEventListener('mouseleave', function() {
+        if (sctIsPanning) { sctIsPanning = false; sctPanLast = null; }
+    });
+})();
+
+function sctShowSbPreview() {
+    document.getElementById('sct-sb-section').style.display = '';
+    sctRefreshSbPreview();
+    if (sctSbPreviewInterval) clearInterval(sctSbPreviewInterval);
+    sctSbPreviewInterval = setInterval(sctRefreshSbPreview, 150);
+}
+
+async function sctRefreshSbPreview() {
+    try {
+        const resp = await fetch('/api/st_scoreboard_capture', {method: 'POST'});
+        const data = await resp.json();
+        if (data.error) return;
+        const img = document.getElementById('sct-sb-img');
+        img.src = 'data:image/jpeg;base64,' + data.base64;
+        img.onload = () => {
+            const canvas = document.getElementById('sct-sb-canvas');
+            if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+                canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+            }
+            sctRedrawSbCanvas();
+        };
+    } catch(e) {}
+}
+
+function sctSetSubMode(mode) {
+    sctSubMode = mode;
+    sctRenderMarkButtons();
+    document.getElementById('sct-sb-preview').style.cursor = 'crosshair';
+}
+
+function sctRedrawSbCanvas() {
+    const canvas = document.getElementById('sct-sb-canvas');
+    if (!canvas || !sctScoreboard) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const sx = canvas.width / sctScoreboard.w, sy = canvas.height / sctScoreboard.h;
+    for (const [key, r] of Object.entries(sctSubRegions)) {
+        const isHome = key.endsWith('_home');
+        const color = isHome ? '#4caf50' : '#ef5350';
+        const gameKey = key.replace(/_(?:home|away)$/, '');
+        const g = sctTrackedGames[gameKey];
+        const label = isHome ? (g ? g.game.home : 'Home') : (g ? g.game.away : 'Away');
+        ctx.strokeStyle = color; ctx.lineWidth = 2;
+        ctx.strokeRect(r.x*sx, r.y*sy, r.w*sx, r.h*sy);
+        ctx.fillStyle = color; ctx.font = '11px monospace';
+        ctx.fillText(label, r.x*sx+2, r.y*sy-3);
+    }
+    if (sctSbDrawStart && sctSubMode) {
+        const isHome = sctSubMode.endsWith('_home');
+        ctx.strokeStyle = isHome ? '#4caf50' : '#ef5350'; ctx.lineWidth = 2;
+        ctx.setLineDash([4,4]);
+        ctx.strokeRect(sctSbDrawStart.sx, sctSbDrawStart.sy, sctSbDrawStart.dx||0, sctSbDrawStart.dy||0);
+        ctx.setLineDash([]);
+    }
+}
+
+(function() {
+    const preview = document.getElementById('sct-sb-preview');
+    if (!preview) return;
+    preview.addEventListener('mousedown', function(e) {
+        if (!sctSubMode) return; e.preventDefault();
+        const c = sctGetCanvasCoords(e, 'sct-sb-canvas');
+        sctSbDrawStart = {sx: c.x, sy: c.y, dx: 0, dy: 0};
+    });
+    preview.addEventListener('mousemove', function(e) {
+        if (!sctSbDrawStart) return;
+        const c = sctGetCanvasCoords(e, 'sct-sb-canvas');
+        sctSbDrawStart.dx = c.x - sctSbDrawStart.sx; sctSbDrawStart.dy = c.y - sctSbDrawStart.sy;
+        sctRedrawSbCanvas();
+    });
+    preview.addEventListener('mouseup', function(e) {
+        if (!sctSbDrawStart || !sctSubMode || !sctScoreboard) return;
+        const canvas = document.getElementById('sct-sb-canvas');
+        const c = sctGetCanvasCoords(e, 'sct-sb-canvas');
+        let x1 = sctSbDrawStart.sx, y1 = sctSbDrawStart.sy, x2 = c.x, y2 = c.y;
+        if (Math.abs(x2-x1) < 3 || Math.abs(y2-y1) < 3) { sctSbDrawStart = null; return; }
+        const scX = sctScoreboard.w / canvas.width, scY = sctScoreboard.h / canvas.height;
+        const region = {
+            x: Math.round(Math.min(x1,x2)*scX), y: Math.round(Math.min(y1,y2)*scY),
+            w: Math.round(Math.abs(x2-x1)*scX), h: Math.round(Math.abs(y2-y1)*scY),
+        };
+        sctSubRegions[sctSubMode] = region;
+        sctSbDrawStart = null;
+        fetch('/api/st_set_sub_region', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: sctSubMode, region: region}),
+        });
+        if (sctSubMode.endsWith('_home')) {
+            const awayKey = sctSubMode.replace(/_home$/, '_away');
+            if (!sctSubRegions[awayKey]) {
+                sctSubMode = awayKey;
+                sctRedrawSbCanvas();
+                sctRenderMarkButtons();
+                return;
+            }
+        }
+        sctSubMode = null;
+        sctRedrawSbCanvas();
+        sctRenderMarkButtons();
+    });
+})();
+
+function sctRenderMarkButtons() {
+    const el = document.getElementById('sct-mark-buttons');
+    if (!el) return;
+    const keys = Object.keys(sctTrackedGames);
+    if (keys.length === 0) { el.innerHTML = ''; return; }
+    let html = '';
+    for (const key of keys) {
+        const g = sctTrackedGames[key];
+        const homeKey = key + '_home';
+        const awayKey = key + '_away';
+        const homeSet = !!sctSubRegions[homeKey];
+        const awaySet = !!sctSubRegions[awayKey];
+        const homeActive = sctSubMode === homeKey;
+        const awayActive = sctSubMode === awayKey;
+        html += '<span style="color:#777;font-size:10px;margin-right:2px;">' + g.game.home + ' v ' + g.game.away + ':</span>';
+        html += '<button class="sct-sub-btn" data-subkey="' + homeKey + '" '
+            + 'style="padding:2px 6px;font-size:10px;background:' + (homeActive ? '#4caf50' : (homeSet ? '#1b5e20' : '#333'))
+            + ';border:1px solid #4caf50;color:' + (homeActive ? '#000' : '#4caf50') + ';border-radius:3px;cursor:pointer;">'
+            + g.game.home + (homeSet ? ' &#10003;' : '') + '</button>';
+        html += '<button class="sct-sub-btn" data-subkey="' + awayKey + '" '
+            + 'style="padding:2px 6px;font-size:10px;background:' + (awayActive ? '#ef5350' : (awaySet ? '#b71c1c' : '#333'))
+            + ';border:1px solid #ef5350;color:' + (awayActive ? '#000' : '#ef5350') + ';border-radius:3px;cursor:pointer;">'
+            + g.game.away + (awaySet ? ' &#10003;' : '') + '</button>';
+        html += '<span style="margin-right:10px;"></span>';
+    }
+    html += '<button onclick="sctTestAllOCR()" style="padding:2px 6px;font-size:10px;background:#555;border:1px solid #666;color:#ccc;border-radius:3px;cursor:pointer;">Test OCR</button>';
+    el.innerHTML = html;
+}
+
+(function() {
+    document.getElementById('sct-mark-buttons').addEventListener('click', function(e) {
+        const btn = e.target.closest('[data-subkey]');
+        if (btn) sctSetSubMode(btn.dataset.subkey);
+    });
+    document.getElementById('sct-tracked-games').addEventListener('click', function(e) {
+        const btn = e.target.closest('[data-remove-key]');
+        if (btn) { e.stopPropagation(); sctRemoveGame(btn.dataset.removeKey); }
+    });
+})();
+
+async function sctTestAllOCR() {
+    try {
+        const resp = await fetch('/api/st_capture_once', {method: 'POST'});
+        const data = await resp.json();
+        const odds = data.odds || {};
+        for (const [key, g] of Object.entries(sctTrackedGames)) {
+            const safeKey = key.replace(/\\|/g, '_');
+            const ho = odds[key + '_home'], ao = odds[key + '_away'];
+            const rawH = document.getElementById('sct-tg-raw-' + safeKey + '-h');
+            const rawA = document.getElementById('sct-tg-raw-' + safeKey + '-a');
+            if (rawH) rawH.textContent = ho != null ? ho.toFixed(2) : 'fail';
+            if (rawA) rawA.textContent = ao != null ? ao.toFixed(2) : 'fail';
+            if (ho != null && ao != null) {
+                const fair = powerDevig(ho, ao);
+                const fairH = document.getElementById('sct-tg-fair-' + safeKey + '-h');
+                const fairA = document.getElementById('sct-tg-fair-' + safeKey + '-a');
+                if (fairH) fairH.textContent = Math.round(fair.home * 100) + 'c';
+                if (fairA) fairA.textContent = Math.round(fair.away * 100) + 'c';
+            }
+        }
+    } catch(e) {}
+}
+
+// Power devig in JS for display
+function powerDevig(homeOdds, awayOdds) {
+    const ih = 1.0 / homeOdds, ia = 1.0 / awayOdds;
+    let lo = 1.0, hi = 10.0;
+    for (let i = 0; i < 100; i++) {
+        const mid = (lo + hi) / 2.0;
+        const total = Math.pow(ih, mid) + Math.pow(ia, mid);
+        if (total > 1.0) lo = mid; else hi = mid;
+    }
+    const k = (lo + hi) / 2.0;
+    const fh = Math.pow(ih, k), fa = Math.pow(ia, k);
+    const s = fh + fa;
+    return {home: fh / s, away: fa / s};
+}
+
+// ── Screen Track ──
+function toggleScreenTrack() {
+    const section = document.getElementById('screen-trade-section');
+    const btn = document.getElementById('screen-track-btn');
+    const tradeBtn = document.getElementById('screen-trade-btn');
+    if (section.style.display === 'none') {
+        section.style.display = '';
+        tradeBtn.style.display = '';
+        btn.textContent = 'HIDE SCREEN'; btn.style.background = '#b71c1c'; btn.style.color = '#ff5252'; btn.style.borderColor = '#ff5252';
+        if (!sctStreamRunning) sctToggleStream();
+        fetch('/api/st_start', {method: 'POST'});
+        if (!screenTradePoll) screenTradePoll = setInterval(sctPollAll, 200);
+    } else {
+        section.style.display = 'none';
+        btn.textContent = 'SCREEN TRACK'; btn.style.background = '#1a237e'; btn.style.color = '#7986cb'; btn.style.borderColor = '#7986cb';
+        if (screenTrading) stopScreenTrade();
+        tradeBtn.style.display = 'none';
+    }
+}
+
+function sctAddCurrentGame() {
+    if (!currentGame) { alert('Select a match first'); return; }
+    const key = sctGameKey(currentGame);
+    if (sctTrackedGames[key]) return;
+    sctTrackedGames[key] = {
+        game: {...currentGame},
+        lastHomeOdds: null,
+        lastAwayOdds: null,
+    };
+    sctRenderTrackedGames();
+    sctRenderMarkButtons();
+}
+
+function sctRemoveGame(key) {
+    fetch('/api/st_remove_game', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({game_key: key}),
+    });
+    delete sctSubRegions[key + '_home'];
+    delete sctSubRegions[key + '_away'];
+    delete sctTrackedGames[key];
+    sctRenderTrackedGames();
+    sctRenderMarkButtons();
+    sctRedrawSbCanvas();
+    if (Object.keys(sctTrackedGames).length === 0) {
+        if (screenTrading) stopScreenTrade();
+    }
+}
+
+function sctRenderTrackedGames() {
+    const el = document.getElementById('sct-tracked-games');
+    if (!el) return;
+    const keys = Object.keys(sctTrackedGames);
+    if (keys.length === 0) { el.innerHTML = ''; return; }
+    let html = '';
+    for (const key of keys) {
+        const g = sctTrackedGames[key];
+        const safeKey = key.replace(/\\|/g, '_');
+        html += '<div style="display:flex;align-items:center;gap:10px;padding:5px 8px;background:#1a1a2e;border-radius:4px;margin-bottom:3px;font-size:12px;border:1px solid #333;">'
+            + '<span style="color:#e0e0e0;font-weight:bold;min-width:180px;">' + g.game.home + ' vs ' + g.game.away + '</span>'
+            + '<span style="color:#4caf50;">' + g.game.home + ': <b id="sct-tg-fair-' + safeKey + '-h">—</b>'
+            + ' (<span id="sct-tg-raw-' + safeKey + '-h">—</span>)</span>'
+            + '<span style="color:#ef5350;">' + g.game.away + ': <b id="sct-tg-fair-' + safeKey + '-a">—</b>'
+            + ' (<span id="sct-tg-raw-' + safeKey + '-a">—</span>)</span>'
+            + '<button data-remove-key="' + key + '" '
+            + 'style="margin-left:auto;background:#333;border:1px solid #555;color:#ef5350;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px;">✕</button>'
+            + '</div>';
+    }
+    el.innerHTML = html;
+}
+
+// ── Screen Trade (toggle trading on/off) ──
+function toggleScreenTrade() {
+    if (screenTrading) stopScreenTrade(); else startScreenTrade();
+}
+
+function startScreenTrade() {
+    screenTrading = true;
+    for (const g of Object.values(sctTrackedGames)) { g.lastHomeOdds = null; g.lastAwayOdds = null; }
+    const btn = document.getElementById('screen-trade-btn');
+    btn.textContent = 'TRADE OFF'; btn.style.background = '#b71c1c'; btn.style.color = '#ff5252'; btn.style.borderColor = '#ff5252';
+}
+
+async function stopScreenTrade() {
+    screenTrading = false;
+    const btn = document.getElementById('screen-trade-btn');
+    btn.textContent = 'TRADE ON'; btn.style.background = '#1b5e20'; btn.style.color = '#66bb6a'; btn.style.borderColor = '#66bb6a';
+    try {
+        const promises = [];
+        for (const g of Object.values(sctTrackedGames)) {
+            const gm = g.game;
+            if (gm.tickers && gm.tickers.length) {
+                promises.push(fetch('/api/cancel_all', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({tickers: gm.tickers}),
+                }));
+            }
+            if (gm.polySeriesTickers && gm.polySeriesTickers.length) {
+                const tokenIds = [];
+                for (const t of gm.polySeriesTickers) { tokenIds.push(t.token_a); tokenIds.push(t.token_b); }
+                promises.push(fetch('/api/poly_cancel_all', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({token_ids: tokenIds}),
+                }));
+            }
+        }
+        await Promise.all(promises);
+    } catch(e) {}
+}
+
+// ── Poll loop: single state fetch, process all games ──
+async function sctPollAll() {
+    const entries = Object.entries(sctTrackedGames);
+    if (entries.length === 0) return;
+    try {
+        const resp = await fetch('/api/st_state');
+        const state = await resp.json();
+        const odds = state.odds || {};
+        const tradePromises = [];
+
+        for (const [key, g] of entries) {
+            const ho = odds[key + '_home'];
+            const ao = odds[key + '_away'];
+            const safeKey = key.replace(/\\|/g, '_');
+
+            if (ho != null && ao != null) {
+                const fair = powerDevig(ho, ao);
+                const hf = Math.round(fair.home * 100), af = Math.round(fair.away * 100);
+                const rawH = document.getElementById('sct-tg-raw-' + safeKey + '-h');
+                const rawA = document.getElementById('sct-tg-raw-' + safeKey + '-a');
+                const fairH = document.getElementById('sct-tg-fair-' + safeKey + '-h');
+                const fairA = document.getElementById('sct-tg-fair-' + safeKey + '-a');
+                if (rawH) rawH.textContent = ho.toFixed(2);
+                if (rawA) rawA.textContent = ao.toFixed(2);
+                if (fairH) fairH.textContent = hf + 'c';
+                if (fairA) fairA.textContent = af + 'c';
+
+                if (screenTrading && (ho !== g.lastHomeOdds || ao !== g.lastAwayOdds)) {
+                    g.lastHomeOdds = ho; g.lastAwayOdds = ao;
+                    const contracts = parseInt(document.getElementById('contracts').value);
+                    const spread = parseInt(document.getElementById('spread-cents').value);
+                    const gm = g.game;
+                    tradePromises.push(
+                        fetch('/api/screen_trade', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                home: gm.home, away: gm.away,
+                                tickers: gm.tickers,
+                                poly_tickers: gm.polySeriesTickers,
+                                contracts: contracts, spread_cents: spread,
+                                game_key: key,
+                            }),
+                        }).then(r => r.json()).then(d => {
+                            if (d.orders && d.orders.length) renderResults(d);
+                        }).catch(() => {})
+                    );
+                }
+            }
+        }
+        if (tradePromises.length) await Promise.all(tradePromises);
+    } catch(e) {}
+}
 </script>
 </div><!-- /container -->
 </body>
@@ -4972,9 +6614,30 @@ async function futuresRefreshAsks() {
 @app.route('/')
 def index():
     tickers = get_kalshi_cs2_tickers()
+
+    poly_lookup = {}
+    try:
+        our_teams = list({t for key in tickers for t in key})
+        poly_markets = fetch_poly_cs2_markets(pregame_only=False, today_only=False, our_teams=our_teams)
+        for m in poly_markets:
+            if m.get('home_team') and m.get('away_team'):
+                pk = (m['home_team'], m['away_team'])
+                poly_lookup.setdefault(pk, []).append({
+                    'token_a': m['token_a'], 'token_b': m['token_b'],
+                    'team_a': m['team_a'], 'team_b': m['team_b'],
+                    'home_team': m['home_team'], 'away_team': m['away_team'],
+                    'tick_size': m['tick_size'], 'neg_risk': m['neg_risk'],
+                    'price_a': m['price_a'], 'price_b': m['price_b'],
+                    'title': m['title'], 'platform': 'poly',
+                })
+        print(f"  [Poly] Found {sum(len(v) for v in poly_lookup.values())} series markets for {len(poly_lookup)} matchups")
+    except Exception as e:
+        print(f"  [Live Trader] Poly market fetch error: {e}")
+
     games = []
     for key, data in tickers.items():
         home, away = key
+        poly_series = poly_lookup.get((home, away), []) or poly_lookup.get((away, home), [])
         games.append({
             'home': home,
             'away': away,
@@ -4982,9 +6645,148 @@ def index():
             'home_pct': f"{data['home_prob']:.0%}",
             'tickers_json': json.dumps(data['tickers']),
             'ou_tickers_json': json.dumps(data.get('ou_tickers', [])),
+            'poly_series_json': json.dumps(poly_series),
         })
     return render_template_string(HTML_TEMPLATE, games=games, dry_run=DRY_RUN,
                                   contracts=CONTRACTS, spread=SPREAD_CENTS)
+
+
+def _cancel_poly_tokens(poly_tickers):
+    if not POLY_CLIENT:
+        return
+    for t in poly_tickers:
+        try:
+            POLY_CLIENT.cancel_token_orders(t.get('token_a', ''))
+            POLY_CLIENT.cancel_token_orders(t.get('token_b', ''))
+        except Exception:
+            pass
+
+
+def _post_poly_live_orders(poly_tickers, home_fair_cents, home, away,
+                           contracts, spread_cents, ioc=False):
+    orders = []
+    away_fair_cents = 100 - home_fair_cents
+    closeness = min(home_fair_cents, away_fair_cents) / 50.0
+    adj_spread = max(1, int(round(spread_cents * (0.5 + 0.5 * closeness))))
+    home_spread_bid = home_fair_cents - adj_spread
+    away_spread_bid = away_fair_cents - adj_spread
+    skip_home = home_spread_bid < 1
+    skip_away = away_spread_bid < 1
+
+    print(f"[POLY {'IOC' if ioc else 'POST'}] fair={home_fair_cents}c spread={adj_spread}c (base={spread_cents}c) "
+          f"-> home_bid={home_spread_bid}c{'(SKIP)' if skip_home else ''} "
+          f"away_bid={away_spread_bid}c{'(SKIP)' if skip_away else ''} "
+          f"contracts={contracts} shares")
+
+    for t in poly_tickers:
+        token_a = t.get('token_a', '')
+        token_b = t.get('token_b', '')
+        team_a = t.get('team_a', '')
+        team_b = t.get('team_b', '')
+        tick_size = t.get('tick_size', '0.01')
+        neg_risk = t.get('neg_risk', False)
+        poly_home = t.get('home_team', team_a)
+        poly_away = t.get('away_team', team_b)
+
+        # Match model's home team to the correct poly token.
+        # token_a corresponds to team_a, token_b to team_b.
+        home_lower = home.lower()
+        away_lower = away.lower()
+        if team_a.lower() == home_lower or team_b.lower() == away_lower:
+            is_model_home_a = True
+        elif team_b.lower() == home_lower or team_a.lower() == away_lower:
+            is_model_home_a = False
+        else:
+            is_model_home_a = (poly_home == team_a)
+
+        token_model_home = token_a if is_model_home_a else token_b
+        token_model_away = token_b if is_model_home_a else token_a
+        name_model_home = team_a if is_model_home_a else team_b
+        name_model_away = team_b if is_model_home_a else team_a
+
+        print(f"[POLY] Token mapping: model_home={home} -> poly={name_model_home} (token_{'a' if is_model_home_a else 'b'}) | "
+              f"model_away={away} -> poly={name_model_away}")
+
+        with ThreadPoolExecutor(max_workers=2) as ob_pool:
+            fh = ob_pool.submit(get_poly_orderbook, token_model_home)
+            fa = ob_pool.submit(get_poly_orderbook, token_model_away)
+            ob_h = fh.result()
+            ob_a = fa.result()
+        best_bid_h = poly_best_bid(ob_h)
+        best_bid_a = poly_best_bid(ob_a)
+        ask_h_c = int(round(poly_best_ask(ob_h) * 100))
+        ask_a_c = int(round(poly_best_ask(ob_a) * 100))
+
+        # Home side
+        hb = max(1, home_spread_bid)
+        if not ioc:
+            if best_bid_h > 0:
+                hb = min(hb, int(round(best_bid_h * 100)) + 1)
+            if hb >= ask_h_c > 0:
+                hb = ask_h_c - 1
+        if hb > home_fair_cents:
+            hb = home_fair_cents
+
+        # Away side
+        ab = max(1, away_spread_bid)
+        if not ioc:
+            if best_bid_a > 0:
+                ab = min(ab, int(round(best_bid_a * 100)) + 1)
+            if ab >= ask_a_c > 0:
+                ab = ask_a_c - 1
+        if ab > away_fair_cents:
+            ab = away_fair_cents
+
+        print(f"[POLY] {name_model_home} (model home): fair={home_fair_cents}c bid={hb}c ask={ask_h_c}c skip={skip_home}")
+        print(f"[POLY] {name_model_away} (model away): fair={away_fair_cents}c bid={ab}c ask={ask_a_c}c skip={skip_away}")
+
+        def _poly_side(team_name, token_id, bid_cents, fair_cents, skip_flag, best_ask_c):
+            if skip_flag or not (1 <= bid_cents <= 99):
+                return None
+            if DRY_RUN or not POLY_CLIENT:
+                return {'team': f'{team_name} YES (Poly)', 'price': bid_cents,
+                        'contracts': contracts, 'status': 'dry-run'}
+            if ioc:
+                if best_ask_c > bid_cents:
+                    print(f"[POLY] IOC SKIP {team_name}: ask={best_ask_c}c > bid={bid_cents}c")
+                    return None
+                take_price = round(best_ask_c / 100.0, 2)
+                print(f"[POLY] IOC TAKE {team_name} {contracts} shares @ {take_price} "
+                      f"(ask={best_ask_c}c bid={bid_cents}c fair={fair_cents}c)")
+                resp = POLY_CLIENT.place_order(
+                    token_id, "BUY", take_price, contracts,
+                    tick_size=tick_size, neg_risk=neg_risk, order_type="GTC")
+                return {'team': f'{team_name} YES (Poly)', 'price': best_ask_c,
+                        'contracts': contracts,
+                        'status': 'filled' if resp else 'failed'}
+            else:
+                POLY_CLIENT.cancel_token_orders(token_id)
+                price = round(bid_cents / 100.0, 2)
+                print(f"[POLY] GTC BUY {team_name} {contracts} shares @ {price}")
+                resp = POLY_CLIENT.place_order(
+                    token_id, "BUY", price, contracts,
+                    tick_size=tick_size, neg_risk=neg_risk, order_type="GTC")
+                with POLY_TOKEN_LOCK:
+                    POLY_TOKEN_IDS.append(token_id)
+                return {'team': f'{team_name} YES (Poly)', 'price': bid_cents,
+                        'contracts': contracts,
+                        'status': 'placed' if resp else 'failed'}
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = []
+            futures.append(pool.submit(_poly_side, name_model_home, token_model_home,
+                                       hb, home_fair_cents, skip_home, ask_h_c))
+            futures.append(pool.submit(_poly_side, name_model_away, token_model_away,
+                                       ab, away_fair_cents, skip_away, ask_a_c))
+            for f in as_completed(futures):
+                result = f.result()
+                if result:
+                    orders.append(result)
+
+    if orders:
+        print(f"[POLY] Posted {len(orders)} orders: " +
+              ", ".join(f"{o['team']} @ {o['price']}c ({o['status']})" for o in orders))
+    return orders
 
 
 def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False):
@@ -5006,49 +6808,51 @@ def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False
     t_win_pct = data.get('t_win_pct')
     manual_home_buy = data.get('home_buy')
     manual_away_buy = data.get('away_buy')
+    manual_home_money = data.get('home_money')
+    manual_away_money = data.get('away_money')
+    manual_home_alive = data.get('home_alive', 5)
+    manual_away_alive = data.get('away_alive', 5)
 
     map_p = series_to_map_prob(home_prob)
     neutral_map_p = map_p
     ct_round_rate = ct_win_pct / 100.0 if ct_win_pct is not None else None
 
-    # CT/T win % = neutral side advantage (e.g. CT=53 means CT wins 53% of rounds even matchup)
-    # Combine with model skill: shift map_p by side offset (display/per_map only)
-    if ct_win_pct is not None and home_is_ct is not None:
-        side_offset = (ct_win_pct - 50) / 100.0 if home_is_ct else -(ct_win_pct - 50) / 100.0
-        map_p = max(0.01, min(0.99, map_p + side_offset))
-
     per_map = [neutral_map_p] * best_of
     map_prob = map_p
     if maps_played < best_of:
-        per_map[maps_played] = map_p
-        if home_rounds > 0 or away_rounds > 0:
+        if ct_round_rate is not None and home_is_ct is not None:
             map_prob = live_round_win_prob(home_rounds, away_rounds, neutral_map_p,
                                            home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
-            per_map[maps_played] = map_prob
+        elif home_rounds > 0 or away_rounds > 0:
+            map_prob = live_round_win_prob(home_rounds, away_rounds, neutral_map_p,
+                                           home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
+        per_map[maps_played] = map_prob
 
     # Economy adjustment from scoreboard
     econ_info = {}
+    original_home_is_ct = home_is_ct
     sb_state = HLTV_SCRAPER.get_state() if HLTV_SCRAPER else None
     if sb_state and (sb_state.get('ct_players') or sb_state.get('t_players')):
         ct_players = sb_state.get('ct_players', [])
         t_players = sb_state.get('t_players', [])
 
-        # Figure out which side home team is on
+        # Figure out which side home team is on from scoreboard team names
         ct_name = sb_state.get('ct_team', '').lower()
         t_name = sb_state.get('t_team', '').lower()
         home_lower = home.lower()
         away_lower = away.lower()
-        home_is_ct = None
+        sb_home_is_ct = None
         if ct_name and (home_lower in ct_name or ct_name in home_lower):
-            home_is_ct = True
+            sb_home_is_ct = True
         elif t_name and (home_lower in t_name or t_name in home_lower):
-            home_is_ct = False
+            sb_home_is_ct = False
         elif t_name and (away_lower in t_name or t_name in away_lower):
-            home_is_ct = True
+            sb_home_is_ct = True
         elif ct_name and (away_lower in ct_name or ct_name in away_lower):
-            home_is_ct = False
+            sb_home_is_ct = False
 
-        if home_is_ct is not None:
+        if sb_home_is_ct is not None:
+            home_is_ct = sb_home_is_ct
             bomb_planted = sb_state.get('bomb_planted', False)
             timer_secs = sb_state.get('timer_seconds', -1)
             bomb_src = sb_state.get('bomb_source', 'css')
@@ -5077,17 +6881,55 @@ def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False
                       f"round_p={econ_detail['home_round_p']:.3f} "
                       f"econ_map={econ_map_p:.3f} "
                       f"w={econ_detail['econ_weight']:.2f}{phase_tag}")
+                if econ_detail.get('home_buy_if_win'):
+                    print(f"[FWD]  WIN  -> {home} {econ_detail['home_buy_if_win'].upper()} ${econ_detail['home_money_if_win']} "
+                          f"vs {away} {econ_detail['away_buy_if_win'].upper()} ${econ_detail['away_money_if_win']} "
+                          f"-> map {econ_detail['map_prob_if_win']:.1%}")
+                    print(f"[FWD]  LOSE -> {home} {econ_detail['home_buy_if_lose'].upper()} ${econ_detail['home_money_if_lose']} "
+                          f"vs {away} {econ_detail['away_buy_if_lose'].upper()} ${econ_detail['away_money_if_lose']} "
+                          f"-> map {econ_detail['map_prob_if_lose']:.1%}")
 
-    # Manual buy type override — apply when no HLTV scoreboard or override HLTV
-    if manual_home_buy and manual_away_buy and home_is_ct is not None:
-        ct_buy = manual_home_buy if home_is_ct else manual_away_buy
-        t_buy = manual_away_buy if home_is_ct else manual_home_buy
-        matchup_rate = BUY_MATCHUP_RATES.get((ct_buy, t_buy), 0.50)
-        skill_p = neutral_map_p if home_is_ct else (1 - neutral_map_p)
-        econ_weight = 0.55 + abs(matchup_rate - 0.50) * 1.2
-        econ_weight = min(econ_weight, 0.92)
-        ct_round_p = (1 - econ_weight) * skill_p + econ_weight * matchup_rate
-        home_round_p = ct_round_p if home_is_ct else (1 - ct_round_p)
+    # Manual buy/alive override — apply when no HLTV scoreboard
+    has_manual_buy = (manual_home_buy or manual_away_buy) and home_is_ct is not None
+    has_manual_alive = (manual_home_alive != 5 or manual_away_alive != 5) and not econ_info
+
+    if has_manual_buy or has_manual_alive:
+        eff_home_buy = manual_home_buy or 'full'
+        eff_away_buy = manual_away_buy or 'full'
+
+        # Start with skill-based round probability
+        if home_is_ct is not None:
+            skill_p = neutral_map_p if home_is_ct else (1 - neutral_map_p)
+        else:
+            skill_p = map_prob
+
+        home_round_p = skill_p
+
+        # Apply buy type adjustment
+        if has_manual_buy:
+            ct_buy = eff_home_buy if home_is_ct else eff_away_buy
+            t_buy = eff_away_buy if home_is_ct else eff_home_buy
+            matchup_rate = BUY_MATCHUP_RATES.get((ct_buy, t_buy), 0.50)
+            econ_weight = 0.55 + abs(matchup_rate - 0.50) * 1.2
+            econ_weight = min(econ_weight, 0.92)
+            ct_round_p = (1 - econ_weight) * skill_p + econ_weight * matchup_rate
+            home_round_p = ct_round_p if home_is_ct else (1 - ct_round_p)
+
+        # Apply alive adjustment on top
+        if has_manual_alive and home_is_ct is not None:
+            ct_a = manual_home_alive if home_is_ct else manual_away_alive
+            t_a = manual_away_alive if home_is_ct else manual_home_alive
+            alive_rate = ALIVE_ADVANTAGE.get((ct_a, t_a), 0.50)
+            # Blend alive advantage with current round probability
+            alive_shift = alive_rate - 0.50
+            ct_current = home_round_p if home_is_ct else (1 - home_round_p)
+            ct_adjusted = max(0.01, min(0.99, ct_current + alive_shift))
+            home_round_p = ct_adjusted if home_is_ct else (1 - ct_adjusted)
+        elif has_manual_alive:
+            alive_rate = ALIVE_ADVANTAGE.get((manual_home_alive, manual_away_alive), 0.50)
+            alive_shift = alive_rate - 0.50
+            home_round_p = max(0.01, min(0.99, home_round_p + alive_shift))
+
         p_map_if_win = live_round_win_prob(home_rounds + 1, away_rounds, neutral_map_p,
                                             home_is_ct=home_is_ct, ct_round_rate=ct_round_rate)
         p_map_if_lose = live_round_win_prob(home_rounds, away_rounds + 1, neutral_map_p,
@@ -5097,19 +6939,23 @@ def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False
         per_map[map_idx] = econ_map_p
         map_prob = econ_map_p
         econ_info = {
-            'home_buy': manual_home_buy, 'away_buy': manual_away_buy,
-            'home_avg_money': 0, 'away_avg_money': 0,
+            'home_buy': eff_home_buy if has_manual_buy else '?',
+            'away_buy': eff_away_buy if has_manual_buy else '?',
+            'home_avg_money': round(manual_home_money / 5) if manual_home_money else 0,
+            'away_avg_money': round(manual_away_money / 5) if manual_away_money else 0,
             'home_avg_power': 0, 'away_avg_power': 0,
-            'home_alive': 5, 'away_alive': 5,
+            'home_alive': manual_home_alive, 'away_alive': manual_away_alive,
             'home_is_ct': home_is_ct, 'phase': 'manual',
             'bomb_planted': False, 'bomb_status': 'none',
-            'timer_seconds': -1, 'econ_weight': round(econ_weight, 2),
+            'timer_seconds': -1,
+            'econ_weight': round(econ_weight, 2) if has_manual_buy else 0,
             'home_round_p': round(home_round_p, 4),
             'econ_map_prob': round(econ_map_p, 4),
         }
-        print(f"[MANUAL-ECON] {home} [{manual_home_buy.upper()}] vs "
-              f"{away} [{manual_away_buy.upper()}] | "
-              f"round_p={home_round_p:.3f} econ_map={econ_map_p:.3f}")
+        buy_tag = f"[{eff_home_buy.upper()}] vs [{eff_away_buy.upper()}]" if has_manual_buy else ""
+        alive_tag = f"{manual_home_alive}v{manual_away_alive}" if has_manual_alive else "5v5"
+        print(f"[MANUAL] {home} {buy_tag} {alive_tag} {away} | "
+              f"round_p={home_round_p:.3f} map={econ_map_p:.3f}")
 
     if best_of == 1:
         live_wp = per_map[0]
@@ -5139,9 +6985,13 @@ def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False
         'cancelled': False,
     }
 
+    poly_tickers = data.get('poly_tickers', [])
+
     if cancel_first:
         ticker_names = [t['ticker'] for t in tickers if 'ticker' in t]
         cancel_all_live_orders(tickers=ticker_names)
+        if poly_tickers:
+            _cancel_poly_tokens(poly_tickers)
         result['cancelled'] = True
 
     if post_orders_flag and tickers:
@@ -5152,6 +7002,11 @@ def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False
         orders = post_ioc_orders(tickers, home_fair, contracts, spread_cents,
                                  home_name=home, away_name=away)
         result['orders'] = orders
+
+    if poly_tickers and (post_orders_flag or ioc):
+        poly_orders = _post_poly_live_orders(
+            poly_tickers, home_fair, home, away, contracts, spread_cents, ioc=ioc)
+        result['orders'] = result.get('orders', []) + poly_orders
 
     return result
 
@@ -5174,6 +7029,86 @@ def api_compute_and_ioc():
 @app.route('/api/cancel_and_repost', methods=['POST'])
 def api_cancel_and_repost():
     return jsonify(_compute_and_post(request.json, cancel_first=True))
+
+
+@app.route('/api/auto_trade', methods=['POST'])
+def api_auto_trade():
+    """Cancel existing, compute fair, post at min(fair - spread, best_bid) per side."""
+    data = request.json
+    result = _compute_and_post(data, cancel_first=True, post_orders_flag=False)
+
+    tickers = data.get('tickers', [])
+    contracts = data.get('contracts', CONTRACTS)
+    spread_cents = data.get('spread_cents', SPREAD_CENTS)
+    home_fair = result['home_fair']
+    away_fair = result['away_fair']
+    home = result['home']
+    away = result['away']
+
+    home_target = max(1, home_fair - spread_cents)
+    away_target = max(1, away_fair - spread_cents)
+
+    orders_to_place = []
+    for t in tickers:
+        ticker = t['ticker']
+        home_is_yes = t['home_is_yes']
+        yes_target = home_target if home_is_yes else away_target
+        no_target = away_target if home_is_yes else home_target
+        yes_team = home if home_is_yes else away
+        no_team = away if home_is_yes else home
+        yes_fair = home_fair if home_is_yes else away_fair
+        no_fair = away_fair if home_is_yes else home_fair
+
+        ob = _fetch_orderbook_prices(ticker)
+        if ob:
+            # Cap at best bid — never go above it
+            if ob['yes_best_bid'] is not None:
+                yes_target = min(yes_target, ob['yes_best_bid'])
+            if ob['no_best_bid'] is not None:
+                no_target = min(no_target, ob['no_best_bid'])
+            # Also cap below best ask to stay maker
+            if ob['yes_best_ask'] is not None:
+                yes_target = min(yes_target, ob['yes_best_ask'] - 1)
+            if ob['no_best_ask'] is not None:
+                no_target = min(no_target, ob['no_best_ask'] - 1)
+
+        if 1 <= yes_target <= 99 and yes_target < yes_fair:
+            orders_to_place.append({
+                'ticker': ticker, 'side': 'yes', 'price': yes_target,
+                'team': f"{yes_team} YES", 'fair': yes_fair,
+            })
+        if 1 <= no_target <= 99 and no_target < no_fair:
+            orders_to_place.append({
+                'ticker': ticker, 'side': 'no', 'price': no_target,
+                'team': f"{no_team} NO", 'fair': no_fair,
+            })
+
+    print(f"[AUTO-TRADE] {home} fair={home_fair}c target={home_target}c | "
+          f"{away} fair={away_fair}c target={away_target}c | "
+          f"{len(orders_to_place)} orders")
+
+    results = []
+    def _place(spec):
+        ok = place_tracked_order(spec['ticker'], spec['side'], contracts, spec['price'])
+        return {
+            'team': spec['team'], 'ticker': spec['ticker'],
+            'kalshi_side': spec['side'], 'fair': spec['fair'],
+            'price': spec['price'], 'contracts': contracts,
+            'status': 'placed' if ok else 'failed',
+        }
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for f in as_completed([pool.submit(_place, o) for o in orders_to_place]):
+            results.append(f.result())
+
+    poly_tickers = data.get('poly_tickers', [])
+    if poly_tickers:
+        poly_orders = _post_poly_live_orders(
+            poly_tickers, home_fair, home, away, contracts, spread_cents)
+        results.extend(poly_orders)
+
+    result['orders'] = results
+    return jsonify(result)
 
 
 def _compute_and_post_ou(data, cancel_first=False, post_orders_flag=True, ioc=False):
@@ -5383,6 +7318,70 @@ def api_cancel_all():
     tickers = [t['ticker'] for t in data.get('tickers', []) if 'ticker' in t]
     ok, msg = cancel_all_live_orders(tickers=tickers)
     return jsonify({'ok': ok, 'message': msg})
+
+
+@app.route('/api/poly_cancel_all', methods=['POST'])
+def api_poly_cancel_all():
+    data = request.json
+    token_ids = data.get('token_ids', [])
+    if not token_ids or not POLY_CLIENT:
+        msg = 'Poly: no client (dry run)' if not POLY_CLIENT else 'No tokens to cancel'
+        return jsonify({'message': msg})
+    cancelled = 0
+    for tid in token_ids:
+        if tid:
+            try:
+                POLY_CLIENT.cancel_token_orders(tid)
+                cancelled += 1
+            except Exception:
+                pass
+    with POLY_TOKEN_LOCK:
+        for tid in token_ids:
+            if tid in POLY_TOKEN_IDS:
+                POLY_TOKEN_IDS.remove(tid)
+    return jsonify({'message': f'Poly: cancelled {cancelled}/{len(token_ids)} markets'})
+
+
+@app.route('/api/poly_orderbook', methods=['POST'])
+def api_poly_orderbook():
+    data = request.json
+    poly_tickers = data.get('poly_tickers', [])
+    results = []
+    for t in poly_tickers:
+        token_a = t.get('token_a', '')
+        token_b = t.get('token_b', '')
+        team_a = t.get('team_a', '?')
+        team_b = t.get('team_b', '?')
+        home_team = t.get('home_team', team_a)
+        away_team = t.get('away_team', team_b)
+        is_home_a = (home_team == team_a)
+        token_home = token_a if is_home_a else token_b
+        token_away = token_b if is_home_a else token_a
+        for token, team, opp in [
+            (token_home, home_team, away_team),
+            (token_away, away_team, home_team),
+        ]:
+            try:
+                ob = get_poly_orderbook(token)
+                bids = [[int(round(float(b['price']) * 100)), int(float(b.get('size', 0)))]
+                        for b in ob.get('bids', []) if float(b.get('price', 0)) > 0]
+                asks = [[int(round(float(a['price']) * 100)), int(float(a.get('size', 0)))]
+                        for a in ob.get('asks', []) if float(a.get('price', 0)) > 0]
+                bids.sort(key=lambda x: -x[0])
+                asks.sort(key=lambda x: x[0])
+                results.append({
+                    'ticker': f"Poly:{token[:8]}",
+                    'yes_team': f'{team} (Poly)', 'no_team': f'{opp} (Poly)',
+                    'yes_bids': bids, 'yes_asks': asks,
+                    'my_bid_prices': [], 'my_ask_prices': [],
+                })
+            except Exception as exc:
+                results.append({
+                    'ticker': f"Poly:{token[:8]}",
+                    'yes_team': f'{team} (Poly)', 'no_team': f'{opp} (Poly)',
+                    'error': str(exc),
+                })
+    return jsonify({'books': results})
 
 
 @app.route('/api/manual_order', methods=['POST'])
@@ -5809,6 +7808,14 @@ def api_bracket_simulate():
                             wins[pi] = slot_records[t][0]
                             losses[pi] = slot_records[t][1]
 
+                forced_pairs = []
+                if st.get('mid_stage') and st.get('next_matchups'):
+                    for mu in st['next_matchups']:
+                        t1i = team_idx_map.get(mu.get('team1'))
+                        t2i = team_idx_map.get(mu.get('team2'))
+                        if t1i is not None and t2i is not None:
+                            forced_pairs.append((t1i, t2i))
+
                 active = []
                 advanced = []
                 eliminated = []
@@ -5820,6 +7827,7 @@ def api_bracket_simulate():
                     else:
                         active.append(pi)
 
+                first_round = True
                 max_rounds = w2a + l2e - 1
                 for _ in range(max_rounds):
                     if len(active) < 2:
@@ -5830,6 +7838,10 @@ def api_bracket_simulate():
                         if key not in pools:
                             pools[key] = []
                         pools[key].append(pi)
+
+                    use_forced = first_round and len(forced_pairs) > 0
+                    first_round = False
+
                     for key in pools:
                         pool = pools[key]
                         pool.sort(key=lambda pi: seeds[participants[pi]])
@@ -5847,22 +7859,60 @@ def api_bracket_simulate():
                                     wp_new[jj][ii] = 1.0 - wp_new[ii][jj]
                             wp_by_bo[bo] = wp_new
                         wp = wp_by_bo[bo]
-                        half = len(pool) // 2
-                        for mi in range(half):
-                            p1 = pool[mi]
-                            p2 = pool[len(pool) - 1 - mi]
-                            t1 = participants[p1]
-                            t2 = participants[p2]
-                            if np.random.random() < wp[t1, t2]:
-                                winner, loser = p1, p2
-                            else:
-                                winner, loser = p2, p1
-                            wins[winner] += 1
-                            losses[loser] += 1
-                            if wins[winner] >= w2a:
-                                advanced.append(winner)
-                            if losses[loser] >= l2e:
-                                eliminated.append(loser)
+
+                        if use_forced:
+                            pool_set = set(participants[pi] for pi in pool)
+                            matched = set()
+                            for ft1, ft2 in forced_pairs:
+                                if ft1 in pool_set and ft2 in pool_set and ft1 not in matched and ft2 not in matched:
+                                    p1 = next(pi for pi in pool if participants[pi] == ft1)
+                                    p2 = next(pi for pi in pool if participants[pi] == ft2)
+                                    matched.add(ft1)
+                                    matched.add(ft2)
+                                    if np.random.random() < wp[ft1, ft2]:
+                                        winner, loser = p1, p2
+                                    else:
+                                        winner, loser = p2, p1
+                                    wins[winner] += 1
+                                    losses[loser] += 1
+                                    if wins[winner] >= w2a:
+                                        advanced.append(winner)
+                                    if losses[loser] >= l2e:
+                                        eliminated.append(loser)
+                            remaining = [pi for pi in pool if participants[pi] not in matched]
+                            half = len(remaining) // 2
+                            for mi in range(half):
+                                p1 = remaining[mi]
+                                p2 = remaining[len(remaining) - 1 - mi]
+                                t1 = participants[p1]
+                                t2 = participants[p2]
+                                if np.random.random() < wp[t1, t2]:
+                                    winner, loser = p1, p2
+                                else:
+                                    winner, loser = p2, p1
+                                wins[winner] += 1
+                                losses[loser] += 1
+                                if wins[winner] >= w2a:
+                                    advanced.append(winner)
+                                if losses[loser] >= l2e:
+                                    eliminated.append(loser)
+                        else:
+                            half = len(pool) // 2
+                            for mi in range(half):
+                                p1 = pool[mi]
+                                p2 = pool[len(pool) - 1 - mi]
+                                t1 = participants[p1]
+                                t2 = participants[p2]
+                                if np.random.random() < wp[t1, t2]:
+                                    winner, loser = p1, p2
+                                else:
+                                    winner, loser = p2, p1
+                                wins[winner] += 1
+                                losses[loser] += 1
+                                if wins[winner] >= w2a:
+                                    advanced.append(winner)
+                                if losses[loser] >= l2e:
+                                    eliminated.append(loser)
                     active = [pi for pi in range(num_p) if pi not in advanced and pi not in eliminated
                               and wins[pi] < w2a and losses[pi] < l2e]
 
@@ -6506,6 +8556,14 @@ def api_swiss_simulate():
                         wins[pi] = slot_records[t][0]
                         losses[pi] = slot_records[t][1]
 
+            forced_pairs = []
+            if st.get('mid_stage') and st.get('next_matchups'):
+                for mu in st['next_matchups']:
+                    t1i = team_idx.get(mu.get('team1'))
+                    t2i = team_idx.get(mu.get('team2'))
+                    if t1i is not None and t2i is not None:
+                        forced_pairs.append((t1i, t2i))
+
             active = []
             advanced = []
             eliminated = []
@@ -6517,6 +8575,7 @@ def api_swiss_simulate():
                 else:
                     active.append(pi)
 
+            first_round = True
             max_rounds = w2a + l2e - 1
             for _ in range(max_rounds):
                 if len(active) < 2:
@@ -6529,6 +8588,9 @@ def api_swiss_simulate():
                         pools[key] = []
                     pools[key].append(pi)
 
+                use_forced = first_round and len(forced_pairs) > 0
+                first_round = False
+
                 for key in pools:
                     pool = pools[key]
                     pool.sort(key=lambda pi: seeds[participants[pi]])
@@ -6540,28 +8602,65 @@ def api_swiss_simulate():
                     bo = decider_bo if (is_adv_match or is_elim_match) else match_bo
                     wp = wp_by_bo.get(bo, wp_by_bo[1])
 
-                    half = len(pool) // 2
-                    for mi in range(half):
-                        p1 = pool[mi]
-                        p2 = pool[len(pool) - 1 - mi]
-                        t1 = participants[p1]
-                        t2 = participants[p2]
+                    if use_forced:
+                        pool_set = set(participants[pi] for pi in pool)
+                        matched = set()
+                        for ft1, ft2 in forced_pairs:
+                            if ft1 in pool_set and ft2 in pool_set and ft1 not in matched and ft2 not in matched:
+                                p1 = next(pi for pi in pool if participants[pi] == ft1)
+                                p2 = next(pi for pi in pool if participants[pi] == ft2)
+                                matched.add(ft1)
+                                matched.add(ft2)
+                                if np.random.random() < wp[ft1, ft2]:
+                                    winner, loser = p1, p2
+                                else:
+                                    winner, loser = p2, p1
+                                wins[winner] += 1
+                                losses[loser] += 1
+                                if wins[winner] >= w2a:
+                                    advanced.append(winner)
+                                if losses[loser] >= l2e:
+                                    eliminated.append(loser)
+                        remaining = [pi for pi in pool if participants[pi] not in matched]
+                        half = len(remaining) // 2
+                        for mi in range(half):
+                            p1 = remaining[mi]
+                            p2 = remaining[len(remaining) - 1 - mi]
+                            t1 = participants[p1]
+                            t2 = participants[p2]
+                            if np.random.random() < wp[t1, t2]:
+                                winner, loser = p1, p2
+                            else:
+                                winner, loser = p2, p1
+                            wins[winner] += 1
+                            losses[loser] += 1
+                            if wins[winner] >= w2a:
+                                advanced.append(winner)
+                            if losses[loser] >= l2e:
+                                eliminated.append(loser)
+                    else:
+                        half = len(pool) // 2
+                        for mi in range(half):
+                            p1 = pool[mi]
+                            p2 = pool[len(pool) - 1 - mi]
+                            t1 = participants[p1]
+                            t2 = participants[p2]
 
-                        if np.random.random() < wp[t1, t2]:
-                            winner, loser = p1, p2
-                        else:
-                            winner, loser = p2, p1
+                            if np.random.random() < wp[t1, t2]:
+                                winner, loser = p1, p2
+                            else:
+                                winner, loser = p2, p1
 
-                        wins[winner] += 1
-                        losses[loser] += 1
+                            wins[winner] += 1
+                            losses[loser] += 1
 
-                        if wins[winner] >= w2a:
-                            advanced.append(winner)
-                        if losses[loser] >= l2e:
-                            eliminated.append(loser)
+                            if wins[winner] >= w2a:
+                                advanced.append(winner)
+                            if losses[loser] >= l2e:
+                                eliminated.append(loser)
 
                     if len(pool) % 2 == 1:
-                        leftover = pool[half]
+                        leftover = pool[half] if not use_forced else (pool[-1] if len(pool) % 2 == 1 else None)
                         pass
 
                 active = [pi for pi in range(num_p) if pi not in advanced and pi not in eliminated
@@ -6622,6 +8721,145 @@ def api_swiss_simulate():
         })
 
     return jsonify({'stages': result_stages, 'sims': n_sims})
+
+
+# ── Screen Tracker API ───────────────────────────────────────────────
+
+@app.route('/api/st_screenshot', methods=['POST'])
+def api_st_screenshot():
+    data = request.get_json(force=True) or {}
+    fast = data.get('fast', False)
+    try:
+        result = SCREEN_TRACKER.capture_full_screen(fast=fast)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/st_set_scoreboard', methods=['POST'])
+def api_st_set_scoreboard():
+    data = request.get_json(force=True)
+    SCREEN_TRACKER.set_scoreboard(data)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/st_scoreboard_capture', methods=['POST'])
+def api_st_scoreboard_capture():
+    result = SCREEN_TRACKER.capture_scoreboard()
+    if result is None:
+        return jsonify({'error': 'no scoreboard set'}), 400
+    return jsonify(result)
+
+
+@app.route('/api/st_set_sub_region', methods=['POST'])
+def api_st_set_sub_region():
+    data = request.get_json(force=True)
+    SCREEN_TRACKER.set_sub_region(data['name'], data['region'])
+    return jsonify({'ok': True})
+
+
+@app.route('/api/st_capture_once', methods=['POST'])
+def api_st_capture_once():
+    result = SCREEN_TRACKER.capture_once()
+    return jsonify(result)
+
+
+@app.route('/api/st_start', methods=['POST'])
+def api_st_start():
+    SCREEN_TRACKER.start(interval=0.15)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/st_stop', methods=['POST'])
+def api_st_stop():
+    SCREEN_TRACKER.stop()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/st_state')
+def api_st_state():
+    return jsonify(SCREEN_TRACKER.get_state())
+
+
+@app.route('/api/st_history')
+def api_st_history():
+    return jsonify(SCREEN_TRACKER.get_history())
+
+
+@app.route('/api/st_reset', methods=['POST'])
+def api_st_reset():
+    SCREEN_TRACKER.reset()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/st_clear_regions', methods=['POST'])
+def api_st_clear_regions():
+    data = request.get_json(force=True) or {}
+    game_key = data.get('game_key', '')
+    if game_key:
+        SCREEN_TRACKER.remove_sub_regions(game_key + '_')
+    else:
+        SCREEN_TRACKER.set_scoreboard(None)
+        SCREEN_TRACKER.sub_regions = {}
+    return jsonify({'ok': True})
+
+
+@app.route('/api/st_remove_game', methods=['POST'])
+def api_st_remove_game():
+    data = request.get_json(force=True) or {}
+    game_key = data.get('game_key', '')
+    if game_key:
+        SCREEN_TRACKER.remove_sub_regions(game_key + '_')
+    return jsonify({'ok': True})
+
+
+@app.route('/api/screen_trade', methods=['POST'])
+def api_screen_trade():
+    data = request.get_json(force=True)
+    home = data.get('home', '')
+    away = data.get('away', '')
+    tickers = data.get('tickers', [])
+    poly_tickers = data.get('poly_tickers', [])
+    contracts = data.get('contracts', CONTRACTS)
+    spread_cents = data.get('spread_cents', SPREAD_CENTS)
+
+    game_key = data.get('game_key', f"{home}|{away}")
+    state = SCREEN_TRACKER.get_state()
+    odds = state.get('odds', {})
+    home_odds = odds.get(f"{game_key}_home")
+    away_odds = odds.get(f"{game_key}_away")
+    if not home_odds or not away_odds:
+        return jsonify({'error': 'No odds from screen tracker', 'orders': []}), 400
+
+    home_fair_prob, away_fair_prob = power_devig(home_odds, away_odds)
+    home_fair_cents = int(round(home_fair_prob * 100))
+    home_fair_cents = max(1, min(99, home_fair_cents))
+
+    print(f"[SCREEN-TRADE] {game_key} odds={home_odds}/{away_odds} -> "
+          f"fair={home_fair_cents}c/{100 - home_fair_cents}c spread={spread_cents}c")
+
+    results = []
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = []
+        if tickers:
+            futures.append(pool.submit(post_ioc_orders,
+                tickers, home_fair_cents, contracts, spread_cents,
+                home, away))
+        if poly_tickers:
+            futures.append(pool.submit(_post_poly_live_orders,
+                poly_tickers, home_fair_cents, home, away,
+                contracts, spread_cents, True))
+        for f in as_completed(futures):
+            results.extend(f.result())
+
+    return jsonify({
+        'home_odds': home_odds,
+        'away_odds': away_odds,
+        'home_fair': home_fair_cents,
+        'away_fair': 100 - home_fair_cents,
+        'orders': results,
+    })
 
 
 # ── Main ─────────────────────────────────────────────────────────────

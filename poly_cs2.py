@@ -95,7 +95,8 @@ class PolyClient:
         )
 
         if size < 5:
-            size = 5
+            print(f"    [Poly] Order size ${size:.2f} below $5 minimum — skipping")
+            return None
 
         if dry_run:
             shares = size / price if price > 0 else 0
@@ -141,6 +142,14 @@ class PolyClient:
             print("  [Poly] Cancelled all open orders")
         except Exception as e:
             print(f"  [Poly] Cancel all failed: {e}")
+
+    def cancel_order(self, order_id):
+        if not self._client or not order_id:
+            return
+        try:
+            self._client.cancel(order_id)
+        except Exception as e:
+            print(f"  [Poly] Cancel order {order_id} failed: {e}")
 
     def cancel_token_orders(self, token_id):
         if not self._client:
@@ -229,6 +238,8 @@ def _normalize_poly_market(mkt, event):
         'event_id': event.get('id', ''),
         'market_id': mkt.get('id', ''),
         'title': event.get('title', ''),
+        'question': mkt.get('question', ''),
+        'group_title': mkt.get('groupItemTitle', ''),
         'team_a': outcomes[0],
         'team_b': outcomes[1],
         'price_a': float(prices[0]) if prices[0] else 0,
@@ -242,6 +253,7 @@ def _normalize_poly_market(mkt, event):
         'end_date': mkt.get('endDate', ''),
         'liquidity': float(mkt.get('liquidityNum', 0) or 0),
         'volume': float(mkt.get('volumeNum', 0) or 0),
+        'sports_market_type': mkt.get('sportsMarketType', ''),
         'home_team': None,
         'away_team': None,
     }
@@ -321,6 +333,128 @@ def fetch_poly_cs2_markets(pregame_only=True, today_only=True, our_teams=None):
     if skipped:
         print(f"  [Poly] Skipped {skipped} live/started markets")
     return all_markets
+
+
+def _detect_game_number(market):
+    """Detect which map/game number a Polymarket market represents.
+    Returns 'game1', 'game2', 'game3', 'match', or None."""
+    q = (market.get('question', '') + ' ' + market.get('group_title', '')).lower()
+    title = market.get('title', '').lower()
+
+    for text in [q, title]:
+        m = re.search(r'game\s*(\d)', text)
+        if m:
+            return f"game{m.group(1)}"
+        m = re.search(r'map\s*(\d)', text)
+        if m:
+            return f"game{m.group(1)}"
+
+    smt = market.get('sports_market_type', '')
+    if smt == 'moneyline':
+        return 'match'
+
+    return None
+
+
+GAME_TO_MAP = {
+    'game1': 'map1',
+    'game2': 'map2',
+    'game3': 'map3',
+    'match': 'series',
+}
+
+
+def fetch_poly_cs2_live_markets(our_teams=None):
+    """Fetch ALL open CS2 markets from Polymarket (match + map winners).
+    No pregame/today filters — intended for live trading."""
+    all_markets = []
+
+    events = []
+    try:
+        for offset in range(0, 2000, 100):
+            resp = requests.get(f"{GAMMA_BASE}/events",
+                                params={'series_slug': 'counter-strike',
+                                        'closed': 'false', 'limit': 100,
+                                        'offset': offset},
+                                timeout=15)
+            if resp.status_code != 200:
+                print(f"  [Poly CS2] Gamma API error: {resp.status_code}")
+                break
+            batch = resp.json()
+            events.extend(batch)
+            if len(batch) < 100:
+                break
+    except Exception as e:
+        print(f"  [Poly CS2] Gamma API error: {e}")
+        if not events:
+            return []
+
+    for event in events:
+        slug = event.get('slug', '')
+        if not slug.startswith('cs2-'):
+            continue
+        if event.get('closed'):
+            continue
+
+        for mkt in event.get('markets', []):
+            m = _normalize_poly_market(mkt, event)
+            if m is None:
+                continue
+
+            prices = json.loads(mkt.get('outcomePrices', '[]'))
+            if prices in [['0', '1'], ['1', '0']]:
+                continue
+
+            game_type = _detect_game_number(m)
+            m['game_type'] = game_type
+            m['map_type'] = GAME_TO_MAP.get(game_type)
+
+            if our_teams:
+                m['home_team'] = match_kalshi_team(m['team_a'], our_teams)
+                m['away_team'] = match_kalshi_team(m['team_b'], our_teams)
+
+            all_markets.append(m)
+
+    print(f"  [Poly CS2] Fetched {len(all_markets)} markets from {len(events)} events")
+    return all_markets
+
+
+def get_poly_cs2_tickers(poly_markets, our_teams=None):
+    """Build map ticker lookup from Polymarket CS2 markets.
+    Returns dict keyed by (home_team, away_team, map_type) with poly ticker info."""
+    result = {}
+    for m in poly_markets:
+        map_type = m.get('map_type')
+        if not map_type:
+            continue
+
+        home = m.get('home_team')
+        away = m.get('away_team')
+        if not home or not away:
+            continue
+
+        key = (home, away, map_type)
+        if key not in result:
+            result[key] = []
+
+        result[key].append({
+            'token_a': m['token_a'],
+            'token_b': m['token_b'],
+            'team_a': m['team_a'],
+            'team_b': m['team_b'],
+            'home_team': home,
+            'away_team': away,
+            'tick_size': m['tick_size'],
+            'neg_risk': m['neg_risk'],
+            'price_a': m['price_a'],
+            'price_b': m['price_b'],
+            'title': m['title'],
+            'question': m.get('question', ''),
+            'platform': 'poly',
+        })
+        print(f"  [Poly CS2] Map matched: {away} @ {home} {map_type} -> {m['title']}")
+
+    return result
 
 
 # ============================================================

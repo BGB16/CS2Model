@@ -254,15 +254,15 @@ def post_and_cancel(api_key_id, private_key, match_info, home_fair, contracts,
 
         ob = fetch_orderbook_best_ask(ticker)
         if ob:
-            if ob.get('yes_best_ask') is not None and yes_bid >= ob['yes_best_ask']:
-                capped = ob['yes_best_ask'] - 1
+            if ob.get('yes_best_bid') is not None and yes_bid > ob['yes_best_bid']:
+                capped = ob['yes_best_bid']
                 print(f"    [MAKER] {yes_team} YES: {yes_bid}c -> {capped}c "
-                      f"(ask={ob['yes_best_ask']}c)")
+                      f"(best_bid={ob['yes_best_bid']}c)")
                 yes_bid = capped
-            if ob.get('no_best_ask') is not None and no_bid >= ob['no_best_ask']:
-                capped = ob['no_best_ask'] - 1
+            if ob.get('no_best_bid') is not None and no_bid > ob['no_best_bid']:
+                capped = ob['no_best_bid']
                 print(f"    [MAKER] {no_team} NO: {no_bid}c -> {capped}c "
-                      f"(ask={ob['no_best_ask']}c)")
+                      f"(best_bid={ob['no_best_bid']}c)")
                 no_bid = capped
 
         yes_bid = max(1, yes_bid)
@@ -296,16 +296,18 @@ def post_and_cancel(api_key_id, private_key, match_info, home_fair, contracts,
             bid_a = round(max(0.01, away_fair / 100 - spread_dec), 2)
             bid_b = round(max(0.01, home_fair / 100 - spread_dec), 2)
 
+        from poly_cs2 import get_best_bid as poly_best_bid
         ob_a = get_poly_orderbook(pm['token_a'])
         ob_b = get_poly_orderbook(pm['token_b'])
         ask_a = poly_best_ask(ob_a)
         ask_b = poly_best_ask(ob_b)
-        tick = float(pm['tick_size'])
+        bbid_a = poly_best_bid(ob_a)
+        bbid_b = poly_best_bid(ob_b)
 
-        if ask_a > 0:
-            bid_a = min(bid_a, round(ask_a - tick, 2))
-        if ask_b > 0:
-            bid_b = min(bid_b, round(ask_b - tick, 2))
+        if bbid_a > 0:
+            bid_a = min(bid_a, bbid_a)
+        if bbid_b > 0:
+            bid_b = min(bid_b, bbid_b)
         bid_a = max(0.01, bid_a)
         bid_b = max(0.01, bid_b)
 
@@ -419,9 +421,16 @@ def main():
     model, encoders, scale = load_model()
     model_team_names = list(encoders['team'].categories_[0])
 
-    from train_model import load_matches, build_training_data, resolve_team_name
-    _train_df = build_training_data(load_matches())
-    _match_counts = _train_df['team'].value_counts().to_dict()
+    from train_model import resolve_team_name, MATCHES_FILE, TEAM_RESET_DATES
+    import pandas as pd
+    _raw = pd.read_csv(MATCHES_FILE, usecols=['date', 'team1', 'team2', 'forfeit'])
+    _raw['date'] = pd.to_datetime(_raw['date'])
+    _raw = _raw[_raw['forfeit'].fillna('').astype(str).str.len() == 0]
+    for _t, _d in TEAM_RESET_DATES.items():
+        _raw = _raw[~((_raw['team1'] == _t) & (_raw['date'] < pd.Timestamp(_d)))]
+        _raw = _raw[~((_raw['team2'] == _t) & (_raw['date'] < pd.Timestamp(_d)))]
+    _match_counts = pd.concat([_raw['team1'], _raw['team2']]).value_counts().to_dict()
+    del _raw
 
     mode = "DRY RUN" if dry_run else "LIVE"
     score_src = "Polymarket" if use_poly_scores else "HLTV"
