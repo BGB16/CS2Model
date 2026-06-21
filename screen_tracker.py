@@ -137,17 +137,37 @@ class ScreenTracker:
             return {'error': str(e)}
 
     def ocr_decimal_odds(self, img):
-        img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+        img = img.resize((img.width * 3, img.height * 3), Image.BILINEAR)
         gray = ImageOps.grayscale(img)
         cfg = '--psm 7 -c tessedit_char_whitelist=0123456789.'
-        for src in [gray, ImageOps.invert(gray)]:
-            bw = src.point(lambda x: 255 if x > 120 else 0)
-            text = pytesseract.image_to_string(bw, config=cfg).strip()
-            m = re.search(r'(\d+\.\d{1,2})', text)
-            if m:
-                val = float(m.group(1))
-                if 1.0 <= val <= 100.0:
-                    return val
+        bw = gray.point(lambda x: 255 if x > 120 else 0)
+        text = pytesseract.image_to_string(bw, config=cfg).strip()
+        m = re.search(r'(\d+\.\d{1,2})', text)
+        if m:
+            val = float(m.group(1))
+            if 1.0 <= val <= 100.0:
+                return val
+        bw = ImageOps.invert(gray).point(lambda x: 255 if x > 120 else 0)
+        text = pytesseract.image_to_string(bw, config=cfg).strip()
+        m = re.search(r'(\d+\.\d{1,2})', text)
+        if m:
+            val = float(m.group(1))
+            if 1.0 <= val <= 100.0:
+                return val
+        return None
+
+    def ocr_text(self, img):
+        img = img.resize((img.width * 3, img.height * 3), Image.BILINEAR)
+        gray = ImageOps.grayscale(img)
+        cfg = '--psm 7'
+        bw = gray.point(lambda x: 255 if x > 120 else 0)
+        text = pytesseract.image_to_string(bw, config=cfg).strip()
+        if text:
+            return text
+        bw = ImageOps.invert(gray).point(lambda x: 255 if x > 120 else 0)
+        text = pytesseract.image_to_string(bw, config=cfg).strip()
+        if text:
+            return text
         return None
 
     def capture_once(self):
@@ -168,25 +188,36 @@ class ScreenTracker:
         sx = pw / sb['w'] if sb['w'] else 1
         sy = ph / sb['h'] if sb['h'] else 1
 
+        labels = {}
         for key, sr in self.sub_regions.items():
             try:
                 crop = sb_img.crop((
                     int(sr['x'] * sx), int(sr['y'] * sy),
                     int((sr['x'] + sr['w']) * sx), int((sr['y'] + sr['h']) * sy),
                 ))
-                val = self.ocr_decimal_odds(crop)
-                raw[key] = val
-                if val is not None:
-                    state[key] = val
-                    conf[key] = 'ok'
+                if key.endswith('_label'):
+                    val = self.ocr_text(crop)
+                    raw[key] = val
+                    if val is not None:
+                        labels[key] = val
+                        conf[key] = 'ok'
+                    else:
+                        conf[key] = 'failed'
                 else:
-                    conf[key] = 'failed'
+                    val = self.ocr_decimal_odds(crop)
+                    raw[key] = val
+                    if val is not None:
+                        state[key] = val
+                        conf[key] = 'ok'
+                    else:
+                        conf[key] = 'failed'
             except Exception as e:
                 raw[key] = f'crop error: {e}'
                 conf[key] = 'error'
 
         with self._lock:
             self.latest_state['odds'] = dict(state)
+            self.latest_state['labels'] = dict(labels)
             self.latest_state['raw_ocr'] = raw
             self.latest_state['confidence'] = conf
             result = dict(self.latest_state)

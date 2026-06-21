@@ -218,9 +218,29 @@ def append_matches(rows):
 
 
 
+def _fetch_html_cffi(url):
+    """Fetch page HTML via curl_cffi (no Chrome needed)."""
+    from curl_cffi import requests as cffi_requests
+    session = cffi_requests.Session()
+    resp = session.get(url, impersonate='chrome131', timeout=30,
+                       headers={'Referer': 'https://www.hltv.org/'})
+    if resp.status_code != 200:
+        raise Exception(f"HTTP {resp.status_code}")
+    return resp.text
+
+
 def scrape(max_pages=None, start_date=None, end_date=None, resume=True):
     """Scrape HLTV results by paginating offset."""
-    from hltv_map_monitor import get_hltv_browser, close_hltv_browser
+    use_browser = False
+    browser = None
+    close_browser = lambda: None
+    try:
+        from hltv_map_monitor import get_hltv_browser, close_hltv_browser
+        browser = get_hltv_browser()
+        use_browser = True
+        close_browser = close_hltv_browser
+    except Exception:
+        pass
 
     if start_date is None:
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
@@ -235,10 +255,10 @@ def scrape(max_pages=None, start_date=None, end_date=None, resume=True):
     print(f"  Date range: {start_date} to {end_date}")
     print(f"  Starting at offset: {start_offset}")
     print(f"  Existing match URLs: {len(existing_urls)}")
-
-    print("  Starting browser...", end=" ", flush=True)
-    browser = get_hltv_browser()
-    print("done.")
+    if use_browser:
+        print("  Using Playwright browser")
+    else:
+        print("  Using curl_cffi (no Chrome needed)")
 
     page_num = 0
     offset = start_offset
@@ -258,7 +278,10 @@ def scrape(max_pages=None, start_date=None, end_date=None, resume=True):
             print(f"\n  Page {page_num + 1} (offset={offset})...", end=" ", flush=True)
 
             try:
-                html = browser.get_page_html(url, timeout=30000)
+                if use_browser:
+                    html = browser.get_page_html(url, timeout=30000)
+                else:
+                    html = _fetch_html_cffi(url)
                 consecutive_failures = 0
             except Exception as e:
                 print(f"FAILED: {e}")
@@ -327,7 +350,7 @@ def scrape(max_pages=None, start_date=None, end_date=None, resume=True):
             time.sleep(delay)
 
     finally:
-        close_hltv_browser()
+        close_browser()
 
     print(f"\n  Done! {total_new} new matches scraped.")
     print(f"  Total match URLs in dataset: {len(existing_urls)}")

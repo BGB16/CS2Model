@@ -56,7 +56,259 @@ FUTURES_TOKEN_LOCK = threading.Lock()
 POLY_TOKEN_IDS = []
 POLY_TOKEN_LOCK = threading.Lock()
 
+KALSHI_WS = None
+KALSHI_WS_FILLS = []
+KALSHI_WS_FILLS_LOCK = threading.Lock()
+
 app = Flask(__name__)
+
+
+# ── Kalshi WebSocket Client ─────────────────────────────────────────
+
+class KalshiWS:
+    """Real-time Kalshi WebSocket for instant fill detection and cancel."""
+
+    WS_URL = 'wss://api.elections.kalshi.com/trade-api/ws/v2'
+    WS_PATH = '/trade-api/ws/v2'
+
+    def __init__(self, api_key_id, private_key):
+        self._api_key_id = api_key_id
+        self._private_key = private_key
+        self._ws = None
+        self._thread = None
+        self._running = False
+        self._subscribed_tickers = set()
+        self._msg_id = 0
+        self._lock = threading.Lock()
+        self._on_fill_callback = None
+        self._reconnect_delay = 1
+        self._connected = False
+
+    @property
+    def connected(self):
+        return self._connected
+
+    @property
+    def subscribed_tickers(self):
+        with self._lock:
+            return set(self._subscribed_tickers)
+
+    def start(self, on_fill=None):
+        self._on_fill_callback = on_fill
+        self._running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+        self._connected = False
+
+    def _next_id(self):
+        self._msg_id += 1
+        return self._msg_id
+
+    def subscribe(self, tickers):
+        if not tickers:
+            return
+        new = [t for t in tickers if t not in self._subscribed_tickers]
+        if not new:
+            return
+        with self._lock:
+            self._subscribed_tickers.update(new)
+        if self._ws and self._connected:
+            self._send_subscribe(new)
+
+    def unsubscribe(self, tickers):
+        with self._lock:
+            self._subscribed_tickers -= set(tickers)
+
+    def _send_subscribe(self, tickers):
+        try:
+            self._ws.send(json.dumps({
+                'id': self._next_id(),
+                'cmd': 'subscribe',
+                'params': {
+                    'channels': ['orderbook_delta'],
+                    'market_tickers': tickers,
+                }
+            }))
+            self._ws.send(json.dumps({
+                'id': self._next_id(),
+                'cmd': 'subscribe',
+                'params': {
+                    'channels': ['fill'],
+                    'market_tickers': tickers,
+                }
+            }))
+        except Exception as e:
+            print(f"[KalshiWS] Subscribe error: {e}")
+
+    def _make_ws_headers(self):
+        return make_auth_headers(self._private_key, self._api_key_id, 'GET', self.WS_PATH)
+
+    def _run_loop(self):
+        import websocket as ws_lib
+
+        while self._running:
+            try:
+                hdrs = self._make_ws_headers()
+                header_list = [f"{k}: {v}" for k, v in hdrs.items()]
+                self._ws = ws_lib.create_connection(
+                    self.WS_URL,
+                    header=header_list,
+                    timeout=30,
+                )
+                self._connected = True
+                self._reconnect_delay = 1
+                print(f"[KalshiWS] Connected")
+
+                with self._lock:
+                    tickers = list(self._subscribed_tickers)
+                if tickers:
+                    self._send_subscribe(tickers)
+
+                while self._running:
+                    try:
+                        raw = self._ws.recv()
+                        if raw:
+                            self._handle_message(json.loads(raw))
+                    except ws_lib.WebSocketTimeoutException:
+                        continue
+                    except ws_lib.WebSocketConnectionClosedException:
+                        print(f"[KalshiWS] Connection closed")
+                        break
+                    except Exception as e:
+                        print(f"[KalshiWS] Recv error: {e}")
+                        break
+            except Exception as e:
+                print(f"[KalshiWS] Connection error: {e}")
+
+            self._connected = False
+            if self._running:
+                print(f"[KalshiWS] Reconnecting in {self._reconnect_delay}s...")
+                time.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, 30)
+
+    def _handle_message(self, data):
+        msg_type = data.get('type', '')
+        if msg_type == 'subscribed':
+            channel = data.get('msg', {}).get('channel')
+            sid = data.get('msg', {}).get('sid')
+            print(f"[KalshiWS] Subscribed: {channel} (sid={sid})")
+        elif msg_type == 'fill':
+            self._handle_fill(data.get('msg', {}))
+        elif msg_type == 'orderbook_delta':
+            self._handle_ob_delta(data.get('msg', {}))
+        elif msg_type == 'error':
+            err = data.get('msg', {})
+            print(f"[KalshiWS] Error: {err.get('msg', '')} (code={err.get('code', '')})")
+
+    def _handle_fill(self, msg):
+        ticker = msg.get('market_ticker', '')
+        count = float(msg.get('count_fp', '0'))
+        price = msg.get('yes_price_dollars', '')
+        side = msg.get('side', '')
+        is_taker = msg.get('is_taker', False)
+        order_id = msg.get('order_id', '')
+
+        print(f"[KalshiWS] FILL: {ticker} {side} {count:.0f}@{price} "
+              f"{'TAKER' if is_taker else 'MAKER'} oid={order_id[:8]}")
+
+        with KALSHI_WS_FILLS_LOCK:
+            KALSHI_WS_FILLS.append({
+                'ticker': ticker, 'side': side, 'count': count,
+                'price': price, 'is_taker': is_taker,
+                'order_id': order_id, 'ts': time.time(),
+            })
+            if len(KALSHI_WS_FILLS) > 100:
+                KALSHI_WS_FILLS[:] = KALSHI_WS_FILLS[-100:]
+
+        if self._on_fill_callback:
+            try:
+                self._on_fill_callback(msg)
+            except Exception as e:
+                print(f"[KalshiWS] Fill callback error: {e}")
+
+    def _handle_ob_delta(self, msg):
+        ticker = msg.get('market_ticker', '')
+        price_dollars = msg.get('price_dollars', '')
+        delta_fp = msg.get('delta_fp', '')
+        side = msg.get('side', '')
+        client_oid = msg.get('client_order_id')
+
+        if not client_oid:
+            return
+
+        price_cents = int(round(float(price_dollars) * 100))
+        delta = float(delta_fp)
+
+        if delta < 0:
+            with PLACED_ORDER_LOCK:
+                our_oids = [o for o in PLACED_ORDER_IDS if o['ticker'] == ticker]
+            for o in our_oids:
+                our_yes_price = o['yes_price']
+                if abs(our_yes_price - price_cents) <= 1:
+                    print(f"[KalshiWS] OB hit at {price_cents}c on {ticker} — "
+                          f"canceling remaining orders")
+                    self._fire_cancel(ticker)
+                    break
+
+    def _fire_cancel(self, ticker):
+        event_key = '-'.join(ticker.split('-')[:-1])
+        with PLACED_ORDER_LOCK:
+            event_oids = [o['oid'] for o in PLACED_ORDER_IDS
+                          if '-'.join(o['ticker'].split('-')[:-1]) == event_key]
+        if not event_oids:
+            return
+        def _do_cancel():
+            cancelled = 0
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futs = {pool.submit(_cancel_single_order, oid): oid for oid in event_oids}
+                for f in as_completed(futs):
+                    if f.result():
+                        cancelled += 1
+            with PLACED_ORDER_LOCK:
+                cancelled_set = set(event_oids)
+                PLACED_ORDER_IDS[:] = [o for o in PLACED_ORDER_IDS
+                                       if o['oid'] not in cancelled_set]
+            print(f"[KalshiWS] Cancelled {cancelled}/{len(event_oids)} orders "
+                  f"on {event_key}")
+        threading.Thread(target=_do_cancel, daemon=True).start()
+
+
+def _ws_fill_handler(fill_msg):
+    """On maker fill: cancel remaining resting orders on that event to prevent adverse fills."""
+    is_taker = fill_msg.get('is_taker', False)
+    ticker = fill_msg.get('market_ticker', '')
+    if is_taker or not ticker:
+        return
+    event_key = '-'.join(ticker.split('-')[:-1])
+    with PLACED_ORDER_LOCK:
+        event_oids = [o['oid'] for o in PLACED_ORDER_IDS
+                      if '-'.join(o['ticker'].split('-')[:-1]) == event_key
+                      and o['ticker'] != ticker]
+    if not event_oids:
+        return
+    print(f"[KalshiWS] Maker fill on {ticker} — canceling {len(event_oids)} "
+          f"other orders on {event_key}")
+    def _do():
+        cancelled = 0
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {pool.submit(_cancel_single_order, oid): oid for oid in event_oids}
+            for f in as_completed(futs):
+                if f.result():
+                    cancelled += 1
+        with PLACED_ORDER_LOCK:
+            cancelled_set = set(event_oids)
+            PLACED_ORDER_IDS[:] = [o for o in PLACED_ORDER_IDS
+                                   if o['oid'] not in cancelled_set]
+        print(f"[KalshiWS] Defensive cancel done: {cancelled}/{len(event_oids)}")
+    threading.Thread(target=_do, daemon=True).start()
 
 
 # ── CS2 Weapon & Economy Data ────────────────────────────────────────
@@ -1118,12 +1370,17 @@ def place_tracked_order(ticker, side, count, price_cents):
             })
         return True
 
-    path = '/trade-api/v2/portfolio/orders'
-    url = KALSHI_BASE + '/portfolio/orders'
+    path = '/trade-api/v2/portfolio/events/orders'
+    url = KALSHI_BASE + '/portfolio/events/orders'
+    v2_side = 'bid' if side == 'yes' else 'ask'
+    v2_price = f"{yes_price / 100:.4f}"
     order = {
-        'ticker': ticker, 'action': 'buy', 'side': side,
-        'count': count, 'type': 'limit', 'yes_price': yes_price,
+        'ticker': ticker, 'side': v2_side,
+        'count': str(count), 'price': v2_price,
         'client_order_id': f"cs2-live-{uuid.uuid4()}",
+        'time_in_force': 'good_till_canceled',
+        'self_trade_prevention_type': 'maker',
+        'post_only': True,
     }
     for attempt in range(4):
         headers = make_auth_headers(PRIVATE_KEY, API_KEY_ID, 'POST', path)
@@ -1133,7 +1390,7 @@ def place_tracked_order(ticker, side, count, price_cents):
             print(f"      FAILED: {e}")
             return False
         if resp.status_code == 201:
-            oid = resp.json().get('order', {}).get('order_id', '?')
+            oid = resp.json().get('order_id', '?')
             print(f"      ORDER {oid} {side.upper()} @ {price_cents}c")
             with PLACED_ORDER_LOCK:
                 PLACED_ORDER_IDS.append({
@@ -1155,14 +1412,17 @@ def place_ioc_order(ticker, side, count, price_cents):
         print(f"      [DRY RUN] IOC {count} {side.upper()} @ {price_cents}c")
         return 0, count
 
-    path = '/trade-api/v2/portfolio/orders'
-    url = KALSHI_BASE + '/portfolio/orders'
+    path = '/trade-api/v2/portfolio/events/orders'
+    url = KALSHI_BASE + '/portfolio/events/orders'
     yes_price = price_cents if side == 'yes' else 100 - price_cents
+    v2_side = 'bid' if side == 'yes' else 'ask'
+    v2_price = f"{yes_price / 100:.4f}"
     order = {
-        'ticker': ticker, 'action': 'buy', 'side': side,
-        'count': count, 'type': 'limit', 'yes_price': yes_price,
+        'ticker': ticker, 'side': v2_side,
+        'count': str(count), 'price': v2_price,
         'client_order_id': f"cs2-ioc-{uuid.uuid4()}",
         'time_in_force': 'immediate_or_cancel',
+        'self_trade_prevention_type': 'maker',
     }
     headers = make_auth_headers(PRIVATE_KEY, API_KEY_ID, 'POST', path)
     try:
@@ -1171,8 +1431,8 @@ def place_ioc_order(ticker, side, count, price_cents):
         print(f"      IOC FAILED: {e}")
         return 0, count
     if resp.status_code == 201:
-        od = resp.json().get('order', {})
-        filled = int(float(od.get('fill_count_fp', od.get('fill_count', 0)) or 0))
+        data = resp.json()
+        filled = int(float(data.get('fill_count', '0')))
         if filled > 0:
             print(f"      IOC FILLED {filled}/{count} @ {price_cents}c")
         else:
@@ -1184,8 +1444,8 @@ def place_ioc_order(ticker, side, count, price_cents):
 
 def _cancel_single_order(oid):
     for attempt in range(3):
-        path = f'/trade-api/v2/portfolio/orders/{oid}'
-        url = KALSHI_BASE + f'/portfolio/orders/{oid}'
+        path = f'/trade-api/v2/portfolio/events/orders/{oid}'
+        url = KALSHI_BASE + f'/portfolio/events/orders/{oid}'
         hdrs = make_auth_headers(PRIVATE_KEY, API_KEY_ID, 'DELETE', path)
         try:
             r = http_requests.delete(url, headers=hdrs, timeout=10)
@@ -1201,14 +1461,31 @@ def _cancel_single_order(oid):
 
 
 def cancel_all_live_orders(tickers=None):
-    """Cancel all resting orders concurrently."""
+    """Cancel all resting orders concurrently using tracked IDs first, API fallback."""
     if DRY_RUN:
         with PLACED_ORDER_LOCK:
             PLACED_ORDER_IDS.clear()
         return 0, "DRY RUN — orders cleared"
 
+    ticker_set = set(tickers) if tickers else None
+
     with PLACED_ORDER_LOCK:
-        PLACED_ORDER_IDS.clear()
+        if ticker_set:
+            tracked = [o['oid'] for o in PLACED_ORDER_IDS if o['ticker'] in ticker_set]
+            PLACED_ORDER_IDS[:] = [o for o in PLACED_ORDER_IDS if o['ticker'] not in ticker_set]
+        else:
+            tracked = [o['oid'] for o in PLACED_ORDER_IDS]
+            PLACED_ORDER_IDS.clear()
+
+    if tracked:
+        cancelled = 0
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for f in as_completed({pool.submit(_cancel_single_order, oid): oid for oid in tracked}):
+                if f.result():
+                    cancelled += 1
+        msg = f"Cancelled {cancelled}/{len(tracked)} tracked orders"
+        print(f"[Cancel] {msg}")
+        return 1, msg
 
     if not tickers:
         return 1, "No tickers provided"
@@ -1234,9 +1511,9 @@ def cancel_all_live_orders(tickers=None):
     if not all_oids:
         return 1, "No resting orders found"
 
-    print(f"[Cancel] {len(all_oids)} orders across {len(tickers)} tickers...")
+    print(f"[Cancel] {len(all_oids)} orders across {len(tickers)} tickers (API fallback)...")
     cancelled = 0
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         for f in as_completed({pool.submit(_cancel_single_order, oid): oid for oid in all_oids}):
             if f.result():
                 cancelled += 1
@@ -1249,14 +1526,27 @@ def cancel_all_live_orders(tickers=None):
 LAYER_COUNT = 4
 
 
+def _ev_bid(fair_cents, min_ev_pct):
+    """Compute bid price for a target EV%. Formula: (fair - price) / price >= ev/100.
+    Rearranged: price <= fair / (1 + ev/100). Always round down to integer."""
+    if fair_cents <= 0 or min_ev_pct <= 0:
+        return max(1, fair_cents - 1)
+    price = fair_cents / (1.0 + min_ev_pct / 100.0)
+    return max(1, int(price))
+
+
 def post_live_orders(tickers_list, home_fair_cents, contracts, spread_cents,
-                     home_name='HOME', away_name='AWAY'):
-    """Post maker-only limit orders. Caps price at best_ask - 1 to never cross."""
+                     home_name='HOME', away_name='AWAY', trade_side='both'):
+    """Post maker-only limit orders at target EV%. Caps price at best_ask - 1 to never cross."""
     away_fair_cents = 100 - home_fair_cents
-    home_bid = home_fair_cents - spread_cents
-    away_bid = away_fair_cents - spread_cents
-    skip_home = (home_fair_cents - spread_cents) < 1
-    skip_away = (away_fair_cents - spread_cents) < 1
+    home_bid = _ev_bid(home_fair_cents, spread_cents)
+    away_bid = _ev_bid(away_fair_cents, spread_cents)
+    skip_home = home_bid < 1
+    skip_away = away_bid < 1
+    if trade_side == 'home':
+        skip_away = True
+    elif trade_side == 'away':
+        skip_home = True
 
     orders_to_place = []
     for t in tickers_list:
@@ -1302,9 +1592,11 @@ def post_live_orders(tickers_list, home_fair_cents, contracts, spread_cents,
                 'team': f"{no_team} NO", 'fair': no_fair,
             })
 
+    home_ev = (home_fair_cents - home_bid) / home_bid * 100 if home_bid > 0 else 0
+    away_ev = (away_fair_cents - away_bid) / away_bid * 100 if away_bid > 0 else 0
     print(f"[Post] Firing {len(orders_to_place)} orders | "
-          f"{home_name} fair={home_fair_cents}c bid={home_bid}c | "
-          f"{away_name} fair={away_fair_cents}c bid={away_bid}c")
+          f"{home_name} fair={home_fair_cents}c bid={home_bid}c ev={home_ev:.1f}% | "
+          f"{away_name} fair={away_fair_cents}c bid={away_bid}c ev={away_ev:.1f}%")
 
     results = []
     def _place(spec):
@@ -1322,16 +1614,35 @@ def post_live_orders(tickers_list, home_fair_cents, contracts, spread_cents,
     return results
 
 
+def _shrink_spread(spread_cents, fair_cents):
+    if fair_cents >= 40:
+        return spread_cents
+    if fair_cents >= 30:
+        return max(1, int(round(spread_cents * 0.75)))
+    if fair_cents >= 20:
+        return max(1, int(round(spread_cents * 0.55)))
+    if fair_cents >= 10:
+        return max(1, int(round(spread_cents * 0.35)))
+    return max(1, int(round(spread_cents * 0.20)))
+
+
 def post_ioc_orders(tickers_list, home_fair_cents, contracts, spread_cents,
-                    home_name='HOME', away_name='AWAY'):
+                    home_name='HOME', away_name='AWAY', trade_side='both'):
     """Post IOC orders concurrently."""
     away_fair_cents = 100 - home_fair_cents
-    closeness = min(home_fair_cents, away_fair_cents) / 50.0
-    adj_spread = max(1, int(round(spread_cents * (0.5 + 0.5 * closeness))))
-    skip_home = (home_fair_cents - adj_spread) < 1
-    skip_away = (away_fair_cents - adj_spread) < 1
-    home_bid = max(1, home_fair_cents - adj_spread)
-    away_bid = max(1, away_fair_cents - adj_spread)
+    home_spread = _shrink_spread(spread_cents, home_fair_cents)
+    away_spread = _shrink_spread(spread_cents, away_fair_cents)
+    skip_home = (home_fair_cents - home_spread) < 1
+    skip_away = (away_fair_cents - away_spread) < 1
+    if trade_side == 'home':
+        skip_away = True
+    elif trade_side == 'away':
+        skip_home = True
+    home_bid = max(1, home_fair_cents - home_spread)
+    away_bid = max(1, away_fair_cents - away_spread)
+    print(f"[IOC-SPREAD] fair={home_fair_cents}/{away_fair_cents}c "
+          f"spread={home_spread}/{away_spread}c (base={spread_cents}c) "
+          f"-> bid={home_bid}/{away_bid}c")
 
     orders_to_place = []
     for t in tickers_list:
@@ -2263,12 +2574,88 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
 
     <div class="tab-bar">
         <button class="tab active" onclick="switchTab('trade')">Trade</button>
+        <button class="tab" onclick="switchTab('esports')">Esports</button>
         <button class="tab" onclick="switchTab('ou-trade')">O/U Trade</button>
         <button class="tab" onclick="switchTab('predict')">Predict</button>
         <button class="tab" onclick="switchTab('bracket')">Bracket Builder</button>
         <button class="tab" onclick="switchTab('futures')">Futures</button>
         <button class="tab" onclick="switchTab('forfeit')">Forfeit</button>
         <button class="tab" onclick="switchTab('screen')">Screen Track</button>
+    </div>
+
+    <div id="tab-esports" style="display:none;">
+        <h2 style="color:#e040fb; margin-bottom:8px;">Esports Screen Trader</h2>
+        <p style="font-size:12px; color:#888; margin-bottom:10px;">
+            Track live odds via screen capture for Valorant, LoL, and Dota 2 matches. Add games, mark odds regions, and trade.
+        </p>
+
+        <div style="display:flex; gap:8px; align-items:flex-end; margin-bottom:10px; flex-wrap:wrap;">
+            <div class="input-group">
+                <label style="font-size:11px;">Esport</label>
+                <select id="esp-esport" onchange="espOnEsportChange()" style="width:160px;padding:5px 8px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+                    <option value="">-- Select --</option>
+                    <option value="valorant">Valorant</option>
+                    <option value="lol">League of Legends</option>
+                    <option value="dota2">Dota 2</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label style="font-size:11px;">Match</label>
+                <select id="esp-game-select" style="min-width:300px;padding:5px 8px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+                    <option value="">-- Pick esport first --</option>
+                </select>
+            </div>
+            <button class="btn" onclick="espAddSelectedGame()" style="padding:5px 10px;font-size:11px;background:#7b1fa2;color:#e040fb;border:1px solid #e040fb;font-weight:bold;">Add Game</button>
+            <span id="esp-fetch-status" style="font-size:11px;color:#666;"></span>
+        </div>
+
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+            <button class="btn" id="esp-trade-btn" onclick="espToggleTrade()"
+                style="background:#1b5e20;color:#66bb6a;border-color:#66bb6a;font-weight:bold;padding:5px 14px;font-size:12px;">TRADE ON</button>
+            <button class="btn" id="esp-mode-btn" onclick="espToggleMode()"
+                style="background:#333;color:#ffa726;border-color:#ffa726;font-weight:bold;font-size:11px;padding:5px 10px;">IOC</button>
+            <div class="input-group" style="margin-left:10px;">
+                <label style="font-size:10px;">Contracts</label>
+                <input id="esp-contracts" type="number" value="50" min="1" max="999" style="width:60px;padding:4px 6px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+            </div>
+            <div class="input-group">
+                <label style="font-size:10px;">Spread</label>
+                <input id="esp-spread" type="number" value="6" min="1" max="20" style="width:50px;padding:4px 6px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
+            </div>
+            <span id="esp-ws-status" style="font-size:10px;font-weight:bold;color:#555;">WS:OFF</span>
+        </div>
+
+        <div id="esp-tracked-games" style="margin-bottom:8px;"></div>
+        <div id="esp-trade-log" style="display:none;max-height:120px;overflow-y:auto;margin-bottom:8px;padding:4px 8px;background:#0a0a1a;border:1px solid #333;border-radius:4px;font-family:monospace;font-size:11px;color:#888;"></div>
+
+        <div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+            <button class="btn" id="esp-stream-toggle" onclick="espToggleStream()" style="padding:4px 12px;font-size:11px;background:#333;">Live View</button>
+            <button class="btn esp-region-btn" id="esp-rgn-btn-scoreboard" onclick="espSetRegionMode('scoreboard')"
+                    style="padding:4px 10px;font-size:11px;background:#333;border:1px solid #555;">Mark Odds Region</button>
+            <button class="btn" onclick="espClearAll()" style="padding:4px 8px;font-size:11px;background:#333;color:#ef5350;">Clear All</button>
+            <span id="esp-stream-fps" style="font-size:11px; color:#444;"></span>
+        </div>
+        <div id="esp-screenshot-container" style="position:relative; max-width:100%; overflow:hidden;
+             border:1px solid #333; border-radius:4px; height:250px; background:#111; display:none;">
+            <div id="esp-screen-inner" style="transform-origin:0 0; position:relative; width:100%;">
+                <img id="esp-screen-img" style="display:none; width:100%;">
+                <canvas id="esp-screen-canvas" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
+            </div>
+        </div>
+        <div id="esp-sb-section" style="display:none; margin-top:8px;">
+            <div id="esp-mark-buttons" style="display:flex; gap:6px; margin-bottom:6px; align-items:center; flex-wrap:wrap;"></div>
+            <div id="esp-sb-preview" style="position:relative; border:1px solid #e040fb; border-radius:4px;
+                 background:#111; overflow:hidden; cursor:crosshair;">
+                <img id="esp-sb-img" style="display:block; width:100%;">
+                <canvas id="esp-sb-canvas" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
+            </div>
+        </div>
+
+        <div id="esp-history-section" style="margin-top:12px;">
+            <h3 style="color:#aaa; font-size:13px; margin-bottom:6px;">Trade History</h3>
+            <div id="esp-history-log" style="max-height:200px; overflow-y:auto; font-family:'SF Mono','Menlo',monospace;
+                 font-size:12px; color:#aaa; background:#0a0a0a; border-radius:4px; padding:8px;"></div>
+        </div>
     </div>
 
     <div id="tab-predict" style="display:none;">
@@ -2630,6 +3017,9 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
                 style="background:#1a237e;color:#7986cb;border-color:#7986cb;font-weight:bold;">SCREEN TRACK</button>
             <button class="btn" id="screen-trade-btn" onclick="toggleScreenTrade()" style="display:none;
                 background:#1b5e20;color:#66bb6a;border-color:#66bb6a;font-weight:bold;">TRADE ON</button>
+            <button class="btn" id="screen-mode-btn" onclick="toggleScreenTradeMode()" style="display:none;
+                background:#333;color:#ffa726;border-color:#ffa726;font-weight:bold;font-size:11px;">IOC</button>
+            <span id="ws-status" style="font-size:10px;font-weight:bold;margin-left:8px;color:#555;">WS:OFF</span>
         </div>
 
         <div class="kbd-help">
@@ -2642,6 +3032,7 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
         <div id="screen-trade-section" style="display:none; margin-top:14px; border:1px solid #1a237e; border-radius:6px; padding:12px;">
             <h3 style="color:#7986cb; margin:0 0 8px;">Screen Odds Tracker</h3>
             <div id="sct-tracked-games" style="margin-bottom:8px;"></div>
+            <div id="sct-trade-log" style="display:none;max-height:80px;overflow-y:auto;margin-bottom:8px;padding:4px 8px;background:#0a0a1a;border:1px solid #333;border-radius:4px;font-family:monospace;font-size:11px;color:#888;"></div>
             <div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
                 <button class="btn" id="sct-stream-toggle" onclick="sctToggleStream()" style="padding:4px 12px;font-size:11px;background:#333;">Live View</button>
                 <button class="btn sct-region-btn" id="sct-rgn-btn-scoreboard" onclick="sctSetRegionMode('scoreboard')"
@@ -2661,7 +3052,7 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
             <div id="sct-sb-section" style="display:none; margin-top:8px;">
                 <div id="sct-mark-buttons" style="display:flex; gap:6px; margin-bottom:6px; align-items:center; flex-wrap:wrap;"></div>
                 <div id="sct-sb-preview" style="position:relative; border:1px solid #7986cb; border-radius:4px;
-                     background:#111; overflow:hidden; cursor:crosshair; max-height:150px;">
+                     background:#111; overflow:hidden; cursor:crosshair;">
                     <img id="sct-sb-img" style="display:block; width:100%;">
                     <canvas id="sct-sb-canvas" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
                 </div>
@@ -4329,6 +4720,7 @@ document.addEventListener('keydown', function(e) {
 function switchTab(tab) {
     activeTab = tab;
     document.getElementById('tab-trade').style.display = tab === 'trade' ? '' : 'none';
+    document.getElementById('tab-esports').style.display = tab === 'esports' ? '' : 'none';
     document.getElementById('tab-ou-trade').style.display = tab === 'ou-trade' ? '' : 'none';
     document.getElementById('tab-predict').style.display = tab === 'predict' ? '' : 'none';
     document.getElementById('tab-bracket').style.display = tab === 'bracket' ? '' : 'none';
@@ -6080,6 +6472,7 @@ let sctPanLast = null;
 
 let screenTrading = false;
 let screenTradePoll = null;
+let screenTradeMode = 'ioc';
 
 let sctTrackedGames = {};
 
@@ -6297,19 +6690,21 @@ function sctRedrawSbCanvas() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const sx = canvas.width / sctScoreboard.w, sy = canvas.height / sctScoreboard.h;
     for (const [key, r] of Object.entries(sctSubRegions)) {
-        const isHome = key.endsWith('_home');
-        const color = isHome ? '#4caf50' : '#ef5350';
-        const gameKey = key.replace(/_(?:home|away)$/, '');
+        const isLabel = key.endsWith('_label');
+        const isHome = key.includes('_home');
+        const color = isLabel ? '#ffa726' : (isHome ? '#4caf50' : '#ef5350');
+        const gameKey = key.replace(/_(?:home|away)(?:_label)?$/, '');
         const g = sctTrackedGames[gameKey];
-        const label = isHome ? (g ? g.game.home : 'Home') : (g ? g.game.away : 'Away');
+        const label = isLabel ? 'Label' : (isHome ? (g ? g.game.home : 'Home') : (g ? g.game.away : 'Away'));
         ctx.strokeStyle = color; ctx.lineWidth = 2;
         ctx.strokeRect(r.x*sx, r.y*sy, r.w*sx, r.h*sy);
         ctx.fillStyle = color; ctx.font = '11px monospace';
         ctx.fillText(label, r.x*sx+2, r.y*sy-3);
     }
     if (sctSbDrawStart && sctSubMode) {
-        const isHome = sctSubMode.endsWith('_home');
-        ctx.strokeStyle = isHome ? '#4caf50' : '#ef5350'; ctx.lineWidth = 2;
+        const isLabel = sctSubMode.endsWith('_label');
+        const isHome = sctSubMode.includes('_home');
+        ctx.strokeStyle = isLabel ? '#ffa726' : (isHome ? '#4caf50' : '#ef5350'); ctx.lineWidth = 2;
         ctx.setLineDash([4,4]);
         ctx.strokeRect(sctSbDrawStart.sx, sctSbDrawStart.sy, sctSbDrawStart.dx||0, sctSbDrawStart.dy||0);
         ctx.setLineDash([]);
@@ -6372,19 +6767,33 @@ function sctRenderMarkButtons() {
         const g = sctTrackedGames[key];
         const homeKey = key + '_home';
         const awayKey = key + '_away';
+        const homeLabelKey = key + '_home_label';
+        const awayLabelKey = key + '_away_label';
         const homeSet = !!sctSubRegions[homeKey];
         const awaySet = !!sctSubRegions[awayKey];
+        const homeLabelSet = !!sctSubRegions[homeLabelKey];
+        const awayLabelSet = !!sctSubRegions[awayLabelKey];
         const homeActive = sctSubMode === homeKey;
         const awayActive = sctSubMode === awayKey;
+        const homeLabelActive = sctSubMode === homeLabelKey;
+        const awayLabelActive = sctSubMode === awayLabelKey;
         html += '<span style="color:#777;font-size:10px;margin-right:2px;">' + g.game.home + ' v ' + g.game.away + ':</span>';
         html += '<button class="sct-sub-btn" data-subkey="' + homeKey + '" '
             + 'style="padding:2px 6px;font-size:10px;background:' + (homeActive ? '#4caf50' : (homeSet ? '#1b5e20' : '#333'))
             + ';border:1px solid #4caf50;color:' + (homeActive ? '#000' : '#4caf50') + ';border-radius:3px;cursor:pointer;">'
             + g.game.home + (homeSet ? ' &#10003;' : '') + '</button>';
+        html += '<button class="sct-sub-btn" data-subkey="' + homeLabelKey + '" '
+            + 'style="padding:2px 6px;font-size:10px;background:' + (homeLabelActive ? '#ffa726' : (homeLabelSet ? '#e65100' : '#333'))
+            + ';border:1px solid #ffa726;color:' + (homeLabelActive ? '#000' : '#ffa726') + ';border-radius:3px;cursor:pointer;">'
+            + 'Lbl' + (homeLabelSet ? ' &#10003;' : '') + '</button>';
         html += '<button class="sct-sub-btn" data-subkey="' + awayKey + '" '
             + 'style="padding:2px 6px;font-size:10px;background:' + (awayActive ? '#ef5350' : (awaySet ? '#b71c1c' : '#333'))
             + ';border:1px solid #ef5350;color:' + (awayActive ? '#000' : '#ef5350') + ';border-radius:3px;cursor:pointer;">'
             + g.game.away + (awaySet ? ' &#10003;' : '') + '</button>';
+        html += '<button class="sct-sub-btn" data-subkey="' + awayLabelKey + '" '
+            + 'style="padding:2px 6px;font-size:10px;background:' + (awayLabelActive ? '#ffa726' : (awayLabelSet ? '#e65100' : '#333'))
+            + ';border:1px solid #ffa726;color:' + (awayLabelActive ? '#000' : '#ffa726') + ';border-radius:3px;cursor:pointer;">'
+            + 'Lbl' + (awayLabelSet ? ' &#10003;' : '') + '</button>';
         html += '<span style="margin-right:10px;"></span>';
     }
     html += '<button onclick="sctTestAllOCR()" style="padding:2px 6px;font-size:10px;background:#555;border:1px solid #666;color:#ccc;border-radius:3px;cursor:pointer;">Test OCR</button>';
@@ -6416,10 +6825,13 @@ async function sctTestAllOCR() {
             if (rawA) rawA.textContent = ao != null ? ao.toFixed(2) : 'fail';
             if (ho != null && ao != null) {
                 const fair = powerDevig(ho, ao);
+                const boost = g.boost || 0;
+                const bhf = Math.max(1, Math.min(99, Math.round(fair.home * 100) + boost));
+                const baf = 100 - bhf;
                 const fairH = document.getElementById('sct-tg-fair-' + safeKey + '-h');
                 const fairA = document.getElementById('sct-tg-fair-' + safeKey + '-a');
-                if (fairH) fairH.textContent = Math.round(fair.home * 100) + 'c';
-                if (fairA) fairA.textContent = Math.round(fair.away * 100) + 'c';
+                if (fairH) fairH.textContent = bhf + 'c' + (boost ? ' (' + (boost > 0 ? '+' : '') + boost + ')' : '');
+                if (fairA) fairA.textContent = baf + 'c';
             }
         }
     } catch(e) {}
@@ -6445,18 +6857,21 @@ function toggleScreenTrack() {
     const section = document.getElementById('screen-trade-section');
     const btn = document.getElementById('screen-track-btn');
     const tradeBtn = document.getElementById('screen-trade-btn');
+    const modeBtn = document.getElementById('screen-mode-btn');
     if (section.style.display === 'none') {
         section.style.display = '';
         tradeBtn.style.display = '';
+        modeBtn.style.display = '';
         btn.textContent = 'HIDE SCREEN'; btn.style.background = '#b71c1c'; btn.style.color = '#ff5252'; btn.style.borderColor = '#ff5252';
         if (!sctStreamRunning) sctToggleStream();
         fetch('/api/st_start', {method: 'POST'});
-        if (!screenTradePoll) screenTradePoll = setInterval(sctPollAll, 200);
+        if (!screenTradePoll) screenTradePoll = setInterval(sctPollAll, 60);
     } else {
         section.style.display = 'none';
         btn.textContent = 'SCREEN TRACK'; btn.style.background = '#1a237e'; btn.style.color = '#7986cb'; btn.style.borderColor = '#7986cb';
         if (screenTrading) stopScreenTrade();
         tradeBtn.style.display = 'none';
+        modeBtn.style.display = 'none';
     }
 }
 
@@ -6468,6 +6883,8 @@ function sctAddCurrentGame() {
         game: {...currentGame},
         lastHomeOdds: null,
         lastAwayOdds: null,
+        sideFilter: 'both',
+        boost: 0,
     };
     sctRenderTrackedGames();
     sctRenderMarkButtons();
@@ -6480,6 +6897,8 @@ function sctRemoveGame(key) {
     });
     delete sctSubRegions[key + '_home'];
     delete sctSubRegions[key + '_away'];
+    delete sctSubRegions[key + '_home_label'];
+    delete sctSubRegions[key + '_away_label'];
     delete sctTrackedGames[key];
     sctRenderTrackedGames();
     sctRenderMarkButtons();
@@ -6497,18 +6916,121 @@ function sctRenderTrackedGames() {
     let html = '';
     for (const key of keys) {
         const g = sctTrackedGames[key];
+        const sf = g.sideFilter || 'both';
         const safeKey = key.replace(/\\|/g, '_');
+        const activeStyle = 'background:#1b5e20;color:#66bb6a;border:1px solid #66bb6a;';
+        const inactiveStyle = 'background:#333;color:#888;border:1px solid #555;';
+        const btnBase = 'padding:1px 6px;border-radius:3px;cursor:pointer;font-size:10px;';
         html += '<div style="display:flex;align-items:center;gap:10px;padding:5px 8px;background:#1a1a2e;border-radius:4px;margin-bottom:3px;font-size:12px;border:1px solid #333;">'
             + '<span style="color:#e0e0e0;font-weight:bold;min-width:180px;">' + g.game.home + ' vs ' + g.game.away + '</span>'
             + '<span style="color:#4caf50;">' + g.game.home + ': <b id="sct-tg-fair-' + safeKey + '-h">—</b>'
             + ' (<span id="sct-tg-raw-' + safeKey + '-h">—</span>)</span>'
             + '<span style="color:#ef5350;">' + g.game.away + ': <b id="sct-tg-fair-' + safeKey + '-a">—</b>'
             + ' (<span id="sct-tg-raw-' + safeKey + '-a">—</span>)</span>'
+            + '<span style="display:flex;gap:3px;margin-left:8px;">'
+            + '<button data-side-key="' + key + '" data-side="both" '
+            + 'style="' + btnBase + (sf === 'both' ? activeStyle : inactiveStyle) + '">Both</button>'
+            + '<button data-side-key="' + key + '" data-side="home" '
+            + 'style="' + btnBase + (sf === 'home' ? activeStyle : inactiveStyle) + '">' + g.game.home + '</button>'
+            + '<button data-side-key="' + key + '" data-side="away" '
+            + 'style="' + btnBase + (sf === 'away' ? activeStyle : inactiveStyle) + '">' + g.game.away + '</button>'
+            + '</span>'
+            + '<span style="display:flex;align-items:center;gap:2px;margin-left:8px;">'
+            + '<button data-boost-key="' + key + '" data-boost-delta="-1" '
+            + 'style="' + btnBase + 'background:#333;color:#ef5350;border:1px solid #555;">−1</button>'
+            + '<span id="sct-tg-boost-' + safeKey + '" style="color:#fff;min-width:36px;text-align:center;font-size:11px;">'
+            + (g.boost > 0 ? '+' + g.boost : g.boost) + '%</span>'
+            + '<button data-boost-key="' + key + '" data-boost-delta="1" '
+            + 'style="' + btnBase + 'background:#333;color:#4caf50;border:1px solid #555;">+1</button>'
+            + '</span>'
             + '<button data-remove-key="' + key + '" '
             + 'style="margin-left:auto;background:#333;border:1px solid #555;color:#ef5350;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px;">✕</button>'
             + '</div>';
     }
     el.innerHTML = html;
+    el.querySelectorAll('[data-side-key]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            sctSetSideFilter(btn.dataset.sideKey, btn.dataset.side);
+        });
+    });
+    el.querySelectorAll('[data-boost-key]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            sctAdjustBoost(btn.dataset.boostKey, parseInt(btn.dataset.boostDelta));
+        });
+    });
+}
+
+function sctAdjustBoost(key, delta) {
+    const g = sctTrackedGames[key];
+    if (!g) return;
+    g.boost = Math.max(-20, Math.min(20, (g.boost || 0) + delta));
+    const safeKey = key.replace(/\\|/g, '_');
+    const el = document.getElementById('sct-tg-boost-' + safeKey);
+    if (el) {
+        el.textContent = (g.boost > 0 ? '+' + g.boost : g.boost) + '%';
+        el.style.color = g.boost > 0 ? '#4caf50' : g.boost < 0 ? '#ef5350' : '#fff';
+    }
+    sctLog('Boost ' + key + ' home ' + (g.boost > 0 ? '+' : '') + g.boost + '%');
+}
+
+function playFillSound() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = 880;
+        osc.type = 'sine';
+        gain.gain.value = 0.3;
+        osc.start();
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+        osc.stop(ctx.currentTime + 0.3);
+    } catch(e) {}
+}
+
+function playShiftAlarm() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        for (let i = 0; i < 3; i++) {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.frequency.value = 440;
+            osc.type = 'square';
+            gain.gain.value = 0.4;
+            osc.start(ctx.currentTime + i * 0.25);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.25 + 0.2);
+            osc.stop(ctx.currentTime + i * 0.25 + 0.2);
+        }
+    } catch(e) {}
+}
+
+function sctSetSideFilter(key, side) {
+    if (sctTrackedGames[key]) {
+        sctTrackedGames[key].sideFilter = side;
+        sctRenderTrackedGames();
+    }
+}
+
+function sctLog(msg) {
+    const el = document.getElementById('sct-trade-log');
+    if (!el) return;
+    const now = new Date();
+    const ts = now.toLocaleTimeString('en-US', {hour12: false}) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+    el.innerHTML = '<div><span style="color:#555;">' + ts + '</span> ' + msg + '</div>' + el.innerHTML;
+    if (el.children.length > 50) el.removeChild(el.lastChild);
+}
+
+function toggleScreenTradeMode() {
+    screenTradeMode = screenTradeMode === 'ioc' ? 'maker' : 'ioc';
+    const btn = document.getElementById('screen-mode-btn');
+    if (screenTradeMode === 'maker') {
+        btn.textContent = 'MAKER'; btn.style.background = '#1a237e'; btn.style.color = '#7986cb'; btn.style.borderColor = '#7986cb';
+    } else {
+        btn.textContent = 'IOC'; btn.style.background = '#333'; btn.style.color = '#ffa726'; btn.style.borderColor = '#ffa726';
+    }
 }
 
 // ── Screen Trade (toggle trading on/off) ──
@@ -6518,18 +7040,24 @@ function toggleScreenTrade() {
 
 function startScreenTrade() {
     screenTrading = true;
-    for (const g of Object.values(sctTrackedGames)) { g.lastHomeOdds = null; g.lastAwayOdds = null; }
+    for (const g of Object.values(sctTrackedGames)) { g.lastHomeOdds = null; g.lastAwayOdds = null; g.baseHomeLabel = null; g.baseAwayLabel = null; g.tradeBusy = false; g.locked = false; if (g.makerTimer) { clearTimeout(g.makerTimer); g.makerTimer = null; } g.pendingMakerFair = null; }
     const btn = document.getElementById('screen-trade-btn');
     btn.textContent = 'TRADE OFF'; btn.style.background = '#b71c1c'; btn.style.color = '#ff5252'; btn.style.borderColor = '#ff5252';
+    const log = document.getElementById('sct-trade-log');
+    if (log) { log.style.display = ''; log.innerHTML = ''; }
+    sctLog('<span style="color:#66bb6a;">TRADING ON</span> mode=' + screenTradeMode);
 }
 
 async function stopScreenTrade() {
     screenTrading = false;
     const btn = document.getElementById('screen-trade-btn');
     btn.textContent = 'TRADE ON'; btn.style.background = '#1b5e20'; btn.style.color = '#66bb6a'; btn.style.borderColor = '#66bb6a';
+    sctLog('<span style="color:#ff5252;">TRADING OFF</span>');
     try {
         const promises = [];
         for (const g of Object.values(sctTrackedGames)) {
+            if (g.makerTimer) { clearTimeout(g.makerTimer); g.makerTimer = null; }
+            g.pendingMakerFair = null;
             const gm = g.game;
             if (gm.tickers && gm.tickers.length) {
                 promises.push(fetch('/api/cancel_all', {
@@ -6550,39 +7078,174 @@ async function stopScreenTrade() {
     } catch(e) {}
 }
 
+let lastWsFillCount = 0;
 // ── Poll loop: single state fetch, process all games ──
 async function sctPollAll() {
     const entries = Object.entries(sctTrackedGames);
     if (entries.length === 0) return;
+
+    // Check WS fills in background (non-blocking)
+    if (screenTrading) {
+        fetch('/api/ws_status').then(r => r.json()).then(ws => {
+            const el = document.getElementById('ws-status');
+            if (el) {
+                el.textContent = ws.connected ? 'WS:ON' : 'WS:OFF';
+                el.style.color = ws.connected ? '#66bb6a' : '#ef5350';
+            }
+            if (ws.fills && ws.fills.length > lastWsFillCount) {
+                const newFills = ws.fills.slice(lastWsFillCount);
+                lastWsFillCount = ws.fills.length;
+                for (const f of newFills) {
+                    const tag = f.is_taker ? 'TAKER' : 'MAKER';
+                    sctLog('<span style="color:#ff9800;">[WS FILL] ' + tag + ' ' + f.side + ' ' + f.count + '@' + f.price + ' ' + f.ticker.split('-').pop() + '</span>');
+                    playFillSound();
+                }
+            }
+        }).catch(() => {});
+    }
+
     try {
         const resp = await fetch('/api/st_state');
         const state = await resp.json();
         const odds = state.odds || {};
+        const labels = state.labels || {};
         const tradePromises = [];
+
+        if (screenTrading) {
+            for (const [key, g] of entries) {
+                const hl = labels[key + '_home_label'];
+                const al = labels[key + '_away_label'];
+                if (hl != null && g.baseHomeLabel == null) { g.baseHomeLabel = hl; sctLog('Label baseline set: <span style="color:#ffa726;">' + hl + '</span>'); }
+                if (al != null && g.baseAwayLabel == null) { g.baseAwayLabel = al; sctLog('Label baseline set: <span style="color:#ffa726;">' + al + '</span>'); }
+                if (g.baseHomeLabel != null && hl != null && hl !== g.baseHomeLabel) {
+                    sctLog('<span style="color:#ff5252;">LABEL SHIFT: "' + hl + '" != "' + g.baseHomeLabel + '" — STOPPING</span>');
+                    stopScreenTrade(); playShiftAlarm(); return;
+                }
+                if (g.baseAwayLabel != null && al != null && al !== g.baseAwayLabel) {
+                    sctLog('<span style="color:#ff5252;">LABEL SHIFT: "' + al + '" != "' + g.baseAwayLabel + '" — STOPPING</span>');
+                    stopScreenTrade(); playShiftAlarm(); return;
+                }
+            }
+        }
 
         for (const [key, g] of entries) {
             const ho = odds[key + '_home'];
             const ao = odds[key + '_away'];
             const safeKey = key.replace(/\\|/g, '_');
 
+            if ((ho == null || ao == null) && screenTrading && g.lastHomeOdds != null) {
+                const locked = ho == null && ao == null ? 'BOTH' : (ho == null ? 'HOME' : 'AWAY');
+                if (!g.locked) {
+                    sctLog('<span style="color:#ff5252;font-weight:bold;">LOCKED (' + locked + ') — EMERGENCY CANCEL ' + key + '</span>');
+                    g.locked = true;
+                }
+                if (g.makerTimer) { clearTimeout(g.makerTimer); g.makerTimer = null; }
+                g.pendingMakerFair = null;
+                g.tradeBusy = true;
+                const gm = g.game;
+                if (gm.tickers && gm.tickers.length) {
+                    fetch('/api/cancel_all', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({tickers: gm.tickers}),
+                    }).then(() => {
+                        sctLog('<span style="color:#ffa726;">CANCEL CONFIRMED for ' + key + '</span>');
+                    }).catch(() => {}).finally(() => { g.tradeBusy = false; });
+                } else {
+                    g.tradeBusy = false;
+                }
+            }
             if (ho != null && ao != null) {
+                if (g.locked) {
+                    sctLog('<span style="color:#66bb6a;font-weight:bold;">UNLOCKED ' + key + '</span> odds=' + ho.toFixed(2) + '/' + ao.toFixed(2) + ' anchor=' + (g.lastHomeOdds != null ? g.lastHomeOdds.toFixed(2) : '?') + '/' + (g.lastAwayOdds != null ? g.lastAwayOdds.toFixed(2) : '?'));
+                    g.locked = false;
+                }
                 const fair = powerDevig(ho, ao);
-                const hf = Math.round(fair.home * 100), af = Math.round(fair.away * 100);
+                const boost = g.boost || 0;
+                const hf = Math.max(1, Math.min(99, Math.round(fair.home * 100) + boost));
+                const af = 100 - hf;
                 const rawH = document.getElementById('sct-tg-raw-' + safeKey + '-h');
                 const rawA = document.getElementById('sct-tg-raw-' + safeKey + '-a');
                 const fairH = document.getElementById('sct-tg-fair-' + safeKey + '-h');
                 const fairA = document.getElementById('sct-tg-fair-' + safeKey + '-a');
                 if (rawH) rawH.textContent = ho.toFixed(2);
                 if (rawA) rawA.textContent = ao.toFixed(2);
-                if (fairH) fairH.textContent = hf + 'c';
+                if (fairH) fairH.textContent = hf + 'c' + (boost ? ' (' + (boost > 0 ? '+' : '') + boost + ')' : '');
                 if (fairA) fairA.textContent = af + 'c';
 
                 if (screenTrading && (ho !== g.lastHomeOdds || ao !== g.lastAwayOdds)) {
+                    let tradeSide = 'both';
+                    if (screenTradeMode === 'ioc') {
+                        if (g.lastHomeOdds != null && g.lastAwayOdds != null) {
+                            const homeShortened = ho < g.lastHomeOdds;
+                            const awayShortened = ao < g.lastAwayOdds;
+                            if (homeShortened && !awayShortened) tradeSide = 'home';
+                            else if (awayShortened && !homeShortened) tradeSide = 'away';
+                            else if (!homeShortened && !awayShortened) tradeSide = 'none';
+                            sctLog('Odds moved ' + ho.toFixed(2) + '/' + ao.toFixed(2)
+                                + (homeShortened ? ' <span style="color:#4caf50;">H&darr;</span>' : '')
+                                + (awayShortened ? ' <span style="color:#ef5350;">A&darr;</span>' : '')
+                                + ' &rarr; ' + tradeSide);
+                        } else {
+                            tradeSide = 'none';
+                            sctLog('Baseline set ' + ho.toFixed(2) + '/' + ao.toFixed(2) + ' fair=' + hf + '/' + af);
+                        }
+                    } else {
+                        sctLog('Odds moved ' + ho.toFixed(2) + '/' + ao.toFixed(2) + ' fair=' + hf + '/' + af + ' &rarr; reprice');
+                    }
                     g.lastHomeOdds = ho; g.lastAwayOdds = ao;
-                    const contracts = parseInt(document.getElementById('contracts').value);
-                    const spread = parseInt(document.getElementById('spread-cents').value);
-                    const gm = g.game;
-                    tradePromises.push(
+                    const sf = g.sideFilter || 'both';
+                    if (sf !== 'both') {
+                        if (tradeSide === 'both') tradeSide = sf;
+                        else if (tradeSide !== sf) tradeSide = 'none';
+                    }
+                    if (tradeSide !== 'none' && screenTradeMode === 'maker') {
+                        const gm = g.game;
+                        if (gm.tickers && gm.tickers.length) {
+                            fetch('/api/cancel_all', {
+                                method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({tickers: gm.tickers}),
+                            }).catch(() => {});
+                            sctLog('<span style="color:#ffb74d;">CANCELED — reposting</span>');
+                        }
+                        if (g.makerTimer) clearTimeout(g.makerTimer);
+                        g.pendingMakerFair = {hf, af, tradeSide};
+                        g.makerTimer = setTimeout(() => {
+                            g.makerTimer = null;
+                            const pm = g.pendingMakerFair;
+                            if (!pm || g.tradeBusy) return;
+                            g.tradeBusy = true;
+                            const contracts = parseInt(document.getElementById('contracts').value);
+                            const spread = parseInt(document.getElementById('spread-cents').value);
+                            sctLog('<span style="color:#7986cb;">POSTING MAKER</span> side=' + pm.tradeSide + ' fair=' + pm.hf + '/' + pm.af);
+                            fetch('/api/screen_trade', {
+                                method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({
+                                    home: gm.home, away: gm.away,
+                                    tickers: gm.tickers,
+                                    poly_tickers: gm.polySeriesTickers,
+                                    contracts: contracts, spread_cents: spread,
+                                    game_key: key,
+                                    trade_side: pm.tradeSide,
+                                    mode: 'maker',
+                                    home_fair_cents: pm.hf,
+                                }),
+                            }).then(r => r.json()).then(d => {
+                                if (d.orders && d.orders.length) {
+                                    renderResults(d);
+                                    const fills = d.orders.filter(o => o.status === 'filled' || (o.filled && o.filled > 0));
+                                    if (fills.length) {
+                                        playFillSound();
+                                        fills.forEach(o => sctLog('<span style="color:#66bb6a;">FILLED</span> ' + o.team + ' @' + o.price + 'c'));
+                                    }
+                                }
+                            }).catch(e => { sctLog('<span style="color:#ff5252;">ERROR: ' + e + '</span>'); }).finally(() => { g.tradeBusy = false; });
+                        }, 300);
+                    } else if (tradeSide !== 'none' && !g.tradeBusy) {
+                        g.tradeBusy = true;
+                        const contracts = parseInt(document.getElementById('contracts').value);
+                        const spread = parseInt(document.getElementById('spread-cents').value);
+                        const gm = g.game;
+                        sctLog('<span style="color:#7986cb;">SENDING ' + screenTradeMode.toUpperCase() + '</span> side=' + tradeSide + ' fair=' + hf + '/' + af);
                         fetch('/api/screen_trade', {
                             method: 'POST', headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({
@@ -6591,15 +7254,852 @@ async function sctPollAll() {
                                 poly_tickers: gm.polySeriesTickers,
                                 contracts: contracts, spread_cents: spread,
                                 game_key: key,
+                                trade_side: tradeSide,
+                                mode: screenTradeMode,
+                                home_fair_cents: hf,
                             }),
                         }).then(r => r.json()).then(d => {
-                            if (d.orders && d.orders.length) renderResults(d);
-                        }).catch(() => {})
-                    );
+                            if (d.orders && d.orders.length) {
+                                renderResults(d);
+                                const fills = d.orders.filter(o => o.status === 'filled' || (o.filled && o.filled > 0));
+                                if (fills.length) {
+                                    playFillSound();
+                                    fills.forEach(o => sctLog('<span style="color:#66bb6a;">FILLED</span> ' + o.team + ' @' + o.price + 'c'));
+                                }
+                            }
+                        }).catch(e => { sctLog('<span style="color:#ff5252;">ERROR: ' + e + '</span>'); }).finally(() => { g.tradeBusy = false; });
+                    } else if (tradeSide === 'none') {
+                        sctLog('<span style="color:#555;">no trade (side=none)</span>');
+                    } else if (g.tradeBusy) {
+                        sctLog('<span style="color:#555;">skipped (busy)</span>');
+                    }
                 }
             }
         }
-        if (tradePromises.length) await Promise.all(tradePromises);
+    } catch(e) {}
+}
+
+// ── Esports Screen Trader ─────────────────────────────────
+let espScreenData = null;
+let espStreamRunning = false;
+let espStreamRAF = null;
+let espStreamFetching = false;
+let espStreamFrameCount = 0;
+let espStreamLastFpsTime = 0;
+let espScoreboard = null;
+let espSubRegions = {};
+let espRegionMode = null;
+let espSubMode = null;
+let espDrawStart = null;
+let espSbDrawStart = null;
+let espSbPreviewInterval = null;
+let espZoom = 1;
+let espPanX = 0, espPanY = 0;
+let espIsPanning = false;
+let espPanLast = null;
+
+let espTrading = false;
+let espTradePoll = null;
+let espTradeMode = 'ioc';
+let espTrackedGames = {};
+let espLastWsFillCount = 0;
+
+function espUpdateTransform() {
+    const inner = document.getElementById('esp-screen-inner');
+    if (inner) inner.style.transform = 'scale(' + espZoom + ') translate(' + espPanX + 'px,' + espPanY + 'px)';
+}
+
+function espGetCanvasCoords(e, canvasId) {
+    const canvas = document.getElementById(canvasId || 'esp-screen-canvas');
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return {x: 0, y: 0};
+    return {
+        x: (e.clientX - rect.left) * (canvas.width / rect.width),
+        y: (e.clientY - rect.top) * (canvas.height / rect.height),
+    };
+}
+
+async function espStreamFrame() {
+    if (!espStreamRunning || espStreamFetching) return;
+    espStreamFetching = true;
+    try {
+        const resp = await fetch('/api/st_screenshot', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({fast: true}),
+        });
+        const data = await resp.json();
+        if (!data.error) {
+            espScreenData = data;
+            const img = document.getElementById('esp-screen-img');
+            img.src = 'data:image/' + (data.format || 'png') + ';base64,' + data.base64;
+            img.onload = () => {
+                img.style.display = 'block';
+                const canvas = document.getElementById('esp-screen-canvas');
+                if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+                    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+                }
+                espRedrawCanvas();
+                espStreamFrameCount++;
+                const now = performance.now();
+                if (now - espStreamLastFpsTime > 2000) {
+                    const fps = (espStreamFrameCount / ((now - espStreamLastFpsTime) / 1000)).toFixed(1);
+                    document.getElementById('esp-stream-fps').textContent = fps + ' fps';
+                    espStreamFrameCount = 0; espStreamLastFpsTime = now;
+                }
+            };
+        }
+    } catch(e) {}
+    espStreamFetching = false;
+    if (espStreamRunning) espStreamRAF = setTimeout(espStreamFrame, 0);
+}
+
+function espToggleStream() {
+    const container = document.getElementById('esp-screenshot-container');
+    if (espStreamRunning) {
+        espStreamRunning = false;
+        if (espStreamRAF) { clearTimeout(espStreamRAF); espStreamRAF = null; }
+        container.style.display = 'none';
+        document.getElementById('esp-stream-toggle').textContent = 'Live View';
+        document.getElementById('esp-stream-fps').textContent = '';
+    } else {
+        espStreamRunning = true;
+        espStreamLastFpsTime = performance.now(); espStreamFrameCount = 0;
+        container.style.display = '';
+        document.getElementById('esp-stream-toggle').textContent = 'Hide View';
+        espStreamFrame();
+    }
+}
+
+function espSetRegionMode(mode) {
+    if (!espStreamRunning) espToggleStream();
+    espRegionMode = mode;
+    document.querySelectorAll('.esp-region-btn').forEach(b => {
+        b.style.background = '#333'; b.style.color = '#e0e0e0'; b.style.borderColor = '#555';
+    });
+    const btn = document.getElementById('esp-rgn-btn-' + mode);
+    if (btn) { btn.style.background = '#e040fb'; btn.style.color = '#000'; btn.style.borderColor = '#e040fb'; }
+    document.getElementById('esp-screenshot-container').style.cursor = 'crosshair';
+}
+
+function espRedrawCanvas() {
+    const canvas = document.getElementById('esp-screen-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!espScreenData) return;
+    const sx = canvas.width / espScreenData.width;
+    const sy = canvas.height / espScreenData.height;
+    if (espScoreboard) {
+        ctx.strokeStyle = '#e040fb'; ctx.lineWidth = 2;
+        ctx.strokeRect(espScoreboard.x * sx, espScoreboard.y * sy, espScoreboard.w * sx, espScoreboard.h * sy);
+        ctx.fillStyle = '#e040fb'; ctx.font = '12px monospace';
+        ctx.fillText('Odds Region', espScoreboard.x * sx + 2, espScoreboard.y * sy - 4);
+    }
+    if (espDrawStart && espRegionMode) {
+        ctx.strokeStyle = '#e040fb'; ctx.lineWidth = 2; ctx.setLineDash([4, 4]);
+        ctx.strokeRect(espDrawStart.sx, espDrawStart.sy, espDrawStart.dx || 0, espDrawStart.dy || 0);
+        ctx.setLineDash([]);
+    }
+}
+
+function espClearAll() {
+    espScoreboard = null; espSubRegions = {};
+    espRegionMode = null; espSubMode = null;
+    espTrackedGames = {};
+    fetch('/api/st_clear_regions', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({}),
+    });
+    const canvas = document.getElementById('esp-screen-canvas');
+    if (canvas) canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+    document.getElementById('esp-sb-section').style.display = 'none';
+    if (espSbPreviewInterval) { clearInterval(espSbPreviewInterval); espSbPreviewInterval = null; }
+    espRenderTrackedGames();
+    espRenderMarkButtons();
+}
+
+// Screenshot container mouse handlers
+(function() {
+    const container = document.getElementById('esp-screenshot-container');
+    if (!container) return;
+    container.addEventListener('wheel', function(e) {
+        e.preventDefault();
+        espZoom = Math.max(1, Math.min(6, espZoom + (e.deltaY > 0 ? -0.3 : 0.3)));
+        if (espZoom <= 1) { espZoom = 1; espPanX = 0; espPanY = 0; }
+        espUpdateTransform();
+    }, {passive: false});
+    container.addEventListener('mousedown', function(e) {
+        if (!espScreenData) return;
+        e.preventDefault();
+        if (espRegionMode === 'scoreboard') {
+            espDrawStart = espGetCanvasCoords(e);
+            espDrawStart = {sx: espDrawStart.x, sy: espDrawStart.y, dx: 0, dy: 0};
+        } else {
+            espIsPanning = true; espPanLast = {x: e.clientX, y: e.clientY};
+            container.style.cursor = 'grabbing';
+        }
+    });
+    container.addEventListener('mousemove', function(e) {
+        if (espDrawStart) {
+            const c = espGetCanvasCoords(e);
+            espDrawStart.dx = c.x - espDrawStart.sx; espDrawStart.dy = c.y - espDrawStart.sy;
+            espRedrawCanvas();
+        } else if (espIsPanning && espPanLast) {
+            espPanX += (e.clientX - espPanLast.x) / espZoom;
+            espPanY += (e.clientY - espPanLast.y) / espZoom;
+            espPanLast = {x: e.clientX, y: e.clientY}; espUpdateTransform();
+        }
+    });
+    container.addEventListener('mouseup', function(e) {
+        if (espIsPanning) { espIsPanning = false; espPanLast = null;
+            container.style.cursor = espRegionMode ? 'crosshair' : 'default'; return; }
+        if (!espDrawStart || espRegionMode !== 'scoreboard' || !espScreenData) return;
+        const canvas = document.getElementById('esp-screen-canvas');
+        const c = espGetCanvasCoords(e);
+        let x1 = espDrawStart.sx, y1 = espDrawStart.sy, x2 = c.x, y2 = c.y;
+        if (Math.abs(x2-x1) < 10 || Math.abs(y2-y1) < 10) { espDrawStart = null; return; }
+        const scX = espScreenData.width / canvas.width, scY = espScreenData.height / canvas.height;
+        espScoreboard = {
+            x: Math.round(Math.min(x1,x2)*scX), y: Math.round(Math.min(y1,y2)*scY),
+            w: Math.round(Math.abs(x2-x1)*scX), h: Math.round(Math.abs(y2-y1)*scY),
+        };
+        espDrawStart = null; espRegionMode = null;
+        document.querySelectorAll('.esp-region-btn').forEach(b => {
+            b.style.background = '#333'; b.style.color = '#e0e0e0'; b.style.borderColor = '#555';
+        });
+        container.style.cursor = 'default';
+        espRedrawCanvas();
+        fetch('/api/st_set_scoreboard', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(espScoreboard),
+        });
+        espShowSbPreview();
+    });
+    container.addEventListener('mouseleave', function() {
+        if (espIsPanning) { espIsPanning = false; espPanLast = null; }
+    });
+})();
+
+function espShowSbPreview() {
+    document.getElementById('esp-sb-section').style.display = '';
+    espRefreshSbPreview();
+    if (espSbPreviewInterval) clearInterval(espSbPreviewInterval);
+    espSbPreviewInterval = setInterval(espRefreshSbPreview, 150);
+}
+
+async function espRefreshSbPreview() {
+    try {
+        const resp = await fetch('/api/st_scoreboard_capture', {method: 'POST'});
+        const data = await resp.json();
+        if (data.error) return;
+        const img = document.getElementById('esp-sb-img');
+        img.src = 'data:image/jpeg;base64,' + data.base64;
+        img.onload = () => {
+            const canvas = document.getElementById('esp-sb-canvas');
+            if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+                canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+            }
+            espRedrawSbCanvas();
+        };
+    } catch(e) {}
+}
+
+function espSetSubMode(mode) {
+    espSubMode = mode;
+    espRenderMarkButtons();
+    document.getElementById('esp-sb-preview').style.cursor = 'crosshair';
+}
+
+function espRedrawSbCanvas() {
+    const canvas = document.getElementById('esp-sb-canvas');
+    if (!canvas || !espScoreboard) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const sx = canvas.width / espScoreboard.w, sy = canvas.height / espScoreboard.h;
+    for (const [key, r] of Object.entries(espSubRegions)) {
+        const isLabel = key.endsWith('_label');
+        const isHome = key.includes('_home');
+        const color = isLabel ? '#ffa726' : (isHome ? '#4caf50' : '#ef5350');
+        const gameKey = key.replace(/_(?:home|away)(?:_label)?$/, '');
+        const g = espTrackedGames[gameKey];
+        const label = isLabel ? 'Label' : (isHome ? (g ? g.game.home : 'Home') : (g ? g.game.away : 'Away'));
+        ctx.strokeStyle = color; ctx.lineWidth = 2;
+        ctx.strokeRect(r.x*sx, r.y*sy, r.w*sx, r.h*sy);
+        ctx.fillStyle = color; ctx.font = '11px monospace';
+        ctx.fillText(label, r.x*sx+2, r.y*sy-3);
+    }
+    if (espSbDrawStart && espSubMode) {
+        const isLabel = espSubMode.endsWith('_label');
+        const isHome = espSubMode.includes('_home');
+        ctx.strokeStyle = isLabel ? '#ffa726' : (isHome ? '#4caf50' : '#ef5350'); ctx.lineWidth = 2;
+        ctx.setLineDash([4,4]);
+        ctx.strokeRect(espSbDrawStart.sx, espSbDrawStart.sy, espSbDrawStart.dx||0, espSbDrawStart.dy||0);
+        ctx.setLineDash([]);
+    }
+}
+
+// Scoreboard preview mouse handlers
+(function() {
+    const preview = document.getElementById('esp-sb-preview');
+    if (!preview) return;
+    preview.addEventListener('mousedown', function(e) {
+        if (!espSubMode) return; e.preventDefault();
+        const c = espGetCanvasCoords(e, 'esp-sb-canvas');
+        espSbDrawStart = {sx: c.x, sy: c.y, dx: 0, dy: 0};
+    });
+    preview.addEventListener('mousemove', function(e) {
+        if (!espSbDrawStart) return;
+        const c = espGetCanvasCoords(e, 'esp-sb-canvas');
+        espSbDrawStart.dx = c.x - espSbDrawStart.sx; espSbDrawStart.dy = c.y - espSbDrawStart.sy;
+        espRedrawSbCanvas();
+    });
+    preview.addEventListener('mouseup', function(e) {
+        if (!espSbDrawStart || !espSubMode || !espScoreboard) return;
+        const canvas = document.getElementById('esp-sb-canvas');
+        const c = espGetCanvasCoords(e, 'esp-sb-canvas');
+        let x1 = espSbDrawStart.sx, y1 = espSbDrawStart.sy, x2 = c.x, y2 = c.y;
+        if (Math.abs(x2-x1) < 3 || Math.abs(y2-y1) < 3) { espSbDrawStart = null; return; }
+        const scX = espScoreboard.w / canvas.width, scY = espScoreboard.h / canvas.height;
+        const region = {
+            x: Math.round(Math.min(x1,x2)*scX), y: Math.round(Math.min(y1,y2)*scY),
+            w: Math.round(Math.abs(x2-x1)*scX), h: Math.round(Math.abs(y2-y1)*scY),
+        };
+        espSubRegions[espSubMode] = region;
+        espSbDrawStart = null;
+        fetch('/api/st_set_sub_region', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: espSubMode, region: region}),
+        });
+        if (espSubMode.endsWith('_home')) {
+            const awayKey = espSubMode.replace(/_home$/, '_away');
+            if (!espSubRegions[awayKey]) {
+                espSubMode = awayKey;
+                espRedrawSbCanvas();
+                espRenderMarkButtons();
+                return;
+            }
+        }
+        espSubMode = null;
+        espRedrawSbCanvas();
+        espRenderMarkButtons();
+    });
+})();
+
+function espRenderMarkButtons() {
+    const el = document.getElementById('esp-mark-buttons');
+    if (!el) return;
+    const keys = Object.keys(espTrackedGames);
+    if (keys.length === 0) { el.innerHTML = ''; return; }
+    let html = '';
+    for (const key of keys) {
+        const g = espTrackedGames[key];
+        const homeKey = key + '_home';
+        const awayKey = key + '_away';
+        const homeLabelKey = key + '_home_label';
+        const awayLabelKey = key + '_away_label';
+        const homeSet = !!espSubRegions[homeKey];
+        const awaySet = !!espSubRegions[awayKey];
+        const homeLabelSet = !!espSubRegions[homeLabelKey];
+        const awayLabelSet = !!espSubRegions[awayLabelKey];
+        const homeActive = espSubMode === homeKey;
+        const awayActive = espSubMode === awayKey;
+        const homeLabelActive = espSubMode === homeLabelKey;
+        const awayLabelActive = espSubMode === awayLabelKey;
+        html += '<span style="color:#777;font-size:10px;margin-right:2px;">' + g.game.home + ' v ' + g.game.away + ':</span>';
+        html += '<button class="esp-sub-btn" data-espsubkey="' + homeKey + '" '
+            + 'style="padding:2px 6px;font-size:10px;background:' + (homeActive ? '#4caf50' : (homeSet ? '#1b5e20' : '#333'))
+            + ';border:1px solid #4caf50;color:' + (homeActive ? '#000' : '#4caf50') + ';border-radius:3px;cursor:pointer;">'
+            + g.game.home + (homeSet ? ' &#10003;' : '') + '</button>';
+        html += '<button class="esp-sub-btn" data-espsubkey="' + homeLabelKey + '" '
+            + 'style="padding:2px 6px;font-size:10px;background:' + (homeLabelActive ? '#ffa726' : (homeLabelSet ? '#e65100' : '#333'))
+            + ';border:1px solid #ffa726;color:' + (homeLabelActive ? '#000' : '#ffa726') + ';border-radius:3px;cursor:pointer;">'
+            + 'Lbl' + (homeLabelSet ? ' &#10003;' : '') + '</button>';
+        html += '<button class="esp-sub-btn" data-espsubkey="' + awayKey + '" '
+            + 'style="padding:2px 6px;font-size:10px;background:' + (awayActive ? '#ef5350' : (awaySet ? '#b71c1c' : '#333'))
+            + ';border:1px solid #ef5350;color:' + (awayActive ? '#000' : '#ef5350') + ';border-radius:3px;cursor:pointer;">'
+            + g.game.away + (awaySet ? ' &#10003;' : '') + '</button>';
+        html += '<button class="esp-sub-btn" data-espsubkey="' + awayLabelKey + '" '
+            + 'style="padding:2px 6px;font-size:10px;background:' + (awayLabelActive ? '#ffa726' : (awayLabelSet ? '#e65100' : '#333'))
+            + ';border:1px solid #ffa726;color:' + (awayLabelActive ? '#000' : '#ffa726') + ';border-radius:3px;cursor:pointer;">'
+            + 'Lbl' + (awayLabelSet ? ' &#10003;' : '') + '</button>';
+        html += '<span style="margin-right:10px;"></span>';
+    }
+    html += '<button onclick="espTestAllOCR()" style="padding:2px 6px;font-size:10px;background:#555;border:1px solid #666;color:#ccc;border-radius:3px;cursor:pointer;">Test OCR</button>';
+    el.innerHTML = html;
+}
+
+(function() {
+    document.getElementById('esp-mark-buttons').addEventListener('click', function(e) {
+        const btn = e.target.closest('[data-espsubkey]');
+        if (btn) espSetSubMode(btn.dataset.espsubkey);
+    });
+    document.getElementById('esp-tracked-games').addEventListener('click', function(e) {
+        const btn = e.target.closest('[data-espremove-key]');
+        if (btn) { e.stopPropagation(); espRemoveGame(btn.dataset.espremoveKey); }
+    });
+})();
+
+async function espTestAllOCR() {
+    try {
+        const resp = await fetch('/api/st_capture_once', {method: 'POST'});
+        const data = await resp.json();
+        const odds = data.odds || {};
+        for (const [key, g] of Object.entries(espTrackedGames)) {
+            const safeKey = key.replace(/[|\\]/g, '_');
+            const ho = odds[key + '_home'], ao = odds[key + '_away'];
+            const rawH = document.getElementById('esp-tg-raw-' + safeKey + '-h');
+            const rawA = document.getElementById('esp-tg-raw-' + safeKey + '-a');
+            if (rawH) rawH.textContent = ho != null ? ho.toFixed(2) : 'fail';
+            if (rawA) rawA.textContent = ao != null ? ao.toFixed(2) : 'fail';
+            if (ho != null && ao != null) {
+                const fair = powerDevig(ho, ao);
+                const boost = g.boost || 0;
+                const bhf = Math.max(1, Math.min(99, Math.round(fair.home * 100) + boost));
+                const baf = 100 - bhf;
+                const fairH = document.getElementById('esp-tg-fair-' + safeKey + '-h');
+                const fairA = document.getElementById('esp-tg-fair-' + safeKey + '-a');
+                if (fairH) fairH.textContent = bhf + 'c' + (boost ? ' (' + (boost > 0 ? '+' : '') + boost + ')' : '');
+                if (fairA) fairA.textContent = baf + 'c';
+            }
+        }
+    } catch(e) {}
+}
+
+// ── Fetch games for selected esport ──
+let espAvailableGames = [];
+
+async function espOnEsportChange() {
+    const esport = document.getElementById('esp-esport').value;
+    const sel = document.getElementById('esp-game-select');
+    const status = document.getElementById('esp-fetch-status');
+    if (!esport) {
+        sel.innerHTML = '<option value="">-- Pick esport first --</option>';
+        espAvailableGames = [];
+        return;
+    }
+    sel.innerHTML = '<option value="">Loading...</option>';
+    status.textContent = 'Fetching markets...';
+    status.style.color = '#ffa726';
+    try {
+        const resp = await fetch('/api/esports/fetch_games', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({esport: esport}),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            sel.innerHTML = '<option value="">' + data.error + '</option>';
+            status.textContent = data.error;
+            status.style.color = '#ef5350';
+            espAvailableGames = [];
+            return;
+        }
+        espAvailableGames = data.games || [];
+        if (espAvailableGames.length === 0) {
+            sel.innerHTML = '<option value="">No matches found</option>';
+            status.textContent = 'No matches found';
+            status.style.color = '#ef5350';
+            return;
+        }
+        let html = '<option value="">-- Select a match --</option>';
+        for (let i = 0; i < espAvailableGames.length; i++) {
+            const g = espAvailableGames[i];
+            const kCount = g.tickers ? g.tickers.length : 0;
+            const pCount = g.polySeriesTickers ? g.polySeriesTickers.length : 0;
+            const platforms = [];
+            if (kCount) platforms.push('K:' + kCount);
+            if (pCount) platforms.push('P:' + pCount);
+            const tag = platforms.length ? ' [' + platforms.join(' ') + ']' : '';
+            html += '<option value="' + i + '">' + g.away + ' vs ' + g.home + tag + '</option>';
+        }
+        sel.innerHTML = html;
+        status.textContent = espAvailableGames.length + ' matches';
+        status.style.color = '#66bb6a';
+    } catch(e) {
+        sel.innerHTML = '<option value="">Fetch error</option>';
+        status.textContent = 'Error: ' + e.message;
+        status.style.color = '#ef5350';
+        espAvailableGames = [];
+    }
+}
+
+function espAddSelectedGame() {
+    const sel = document.getElementById('esp-game-select');
+    const idx = parseInt(sel.value);
+    if (isNaN(idx) || !espAvailableGames[idx]) { alert('Select a match first'); return; }
+    const g = espAvailableGames[idx];
+    const esport = document.getElementById('esp-esport').value;
+    const key = g.home + '|' + g.away;
+    if (espTrackedGames[key]) { alert('Already added'); return; }
+
+    espTrackedGames[key] = {
+        game: {home: g.home, away: g.away, esport: esport, tickers: g.tickers || [], polySeriesTickers: g.polySeriesTickers || []},
+        lastHomeOdds: null,
+        lastAwayOdds: null,
+        sideFilter: 'both',
+        boost: 0,
+    };
+    espRenderTrackedGames();
+    espRenderMarkButtons();
+
+    if (!espTradePoll) {
+        fetch('/api/st_start', {method: 'POST'});
+        espTradePoll = setInterval(espPollAll, 60);
+    }
+}
+
+function espRemoveGame(key) {
+    fetch('/api/st_remove_game', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({game_key: key}),
+    });
+    delete espSubRegions[key + '_home'];
+    delete espSubRegions[key + '_away'];
+    delete espSubRegions[key + '_home_label'];
+    delete espSubRegions[key + '_away_label'];
+    delete espTrackedGames[key];
+    espRenderTrackedGames();
+    espRenderMarkButtons();
+    espRedrawSbCanvas();
+    if (Object.keys(espTrackedGames).length === 0 && espTrading) espStopTrade();
+}
+
+const ESP_ESPORT_LABELS = {valorant: 'VAL', lol: 'LoL', dota2: 'Dota'};
+const ESP_ESPORT_COLORS = {valorant: '#ff4655', lol: '#c89b3c', dota2: '#e44d2e'};
+
+function espRenderTrackedGames() {
+    const el = document.getElementById('esp-tracked-games');
+    if (!el) return;
+    const keys = Object.keys(espTrackedGames);
+    if (keys.length === 0) { el.innerHTML = ''; return; }
+    let html = '';
+    for (const key of keys) {
+        const g = espTrackedGames[key];
+        const sf = g.sideFilter || 'both';
+        const safeKey = key.replace(/[|\\]/g, '_');
+        const esport = g.game.esport || 'valorant';
+        const espLabel = ESP_ESPORT_LABELS[esport] || esport;
+        const espColor = ESP_ESPORT_COLORS[esport] || '#e040fb';
+        const activeStyle = 'background:#1b5e20;color:#66bb6a;border:1px solid #66bb6a;';
+        const inactiveStyle = 'background:#333;color:#888;border:1px solid #555;';
+        const btnBase = 'padding:1px 6px;border-radius:3px;cursor:pointer;font-size:10px;';
+        html += '<div style="display:flex;align-items:center;gap:10px;padding:5px 8px;background:#1a1a2e;border-radius:4px;margin-bottom:3px;font-size:12px;border:1px solid #333;">'
+            + '<span style="background:' + espColor + ';color:#000;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:bold;">' + espLabel + '</span>'
+            + '<span style="color:#e0e0e0;font-weight:bold;min-width:160px;">' + g.game.home + ' vs ' + g.game.away + '</span>'
+            + '<span style="color:#4caf50;">' + g.game.home + ': <b id="esp-tg-fair-' + safeKey + '-h">—</b>'
+            + ' (<span id="esp-tg-raw-' + safeKey + '-h">—</span>)</span>'
+            + '<span style="color:#ef5350;">' + g.game.away + ': <b id="esp-tg-fair-' + safeKey + '-a">—</b>'
+            + ' (<span id="esp-tg-raw-' + safeKey + '-a">—</span>)</span>'
+            + '<span style="display:flex;gap:3px;margin-left:8px;">'
+            + '<button data-espside-key="' + key + '" data-espside="both" '
+            + 'style="' + btnBase + (sf === 'both' ? activeStyle : inactiveStyle) + '">Both</button>'
+            + '<button data-espside-key="' + key + '" data-espside="home" '
+            + 'style="' + btnBase + (sf === 'home' ? activeStyle : inactiveStyle) + '">' + g.game.home + '</button>'
+            + '<button data-espside-key="' + key + '" data-espside="away" '
+            + 'style="' + btnBase + (sf === 'away' ? activeStyle : inactiveStyle) + '">' + g.game.away + '</button>'
+            + '</span>'
+            + '<span style="display:flex;align-items:center;gap:2px;margin-left:8px;">'
+            + '<button data-espboost-key="' + key + '" data-espboost-delta="-1" '
+            + 'style="' + btnBase + 'background:#333;color:#ef5350;border:1px solid #555;">-1</button>'
+            + '<span id="esp-tg-boost-' + safeKey + '" style="color:#fff;min-width:36px;text-align:center;font-size:11px;">'
+            + (g.boost > 0 ? '+' + g.boost : g.boost) + '%</span>'
+            + '<button data-espboost-key="' + key + '" data-espboost-delta="1" '
+            + 'style="' + btnBase + 'background:#333;color:#4caf50;border:1px solid #555;">+1</button>'
+            + '</span>'
+            + '<button data-espremove-key="' + key + '" '
+            + 'style="margin-left:auto;background:#333;border:1px solid #555;color:#ef5350;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px;">&#10005;</button>'
+            + '</div>';
+    }
+    el.innerHTML = html;
+    el.querySelectorAll('[data-espside-key]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            espSetSideFilter(btn.dataset.espsideKey, btn.dataset.espside);
+        });
+    });
+    el.querySelectorAll('[data-espboost-key]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            espAdjustBoost(btn.dataset.espboostKey, parseInt(btn.dataset.espboostDelta));
+        });
+    });
+}
+
+function espAdjustBoost(key, delta) {
+    const g = espTrackedGames[key];
+    if (!g) return;
+    g.boost = Math.max(-20, Math.min(20, (g.boost || 0) + delta));
+    const safeKey = key.replace(/[|\\]/g, '_');
+    const el = document.getElementById('esp-tg-boost-' + safeKey);
+    if (el) {
+        el.textContent = (g.boost > 0 ? '+' + g.boost : g.boost) + '%';
+        el.style.color = g.boost > 0 ? '#4caf50' : g.boost < 0 ? '#ef5350' : '#fff';
+    }
+    espLog('Boost ' + key + ' home ' + (g.boost > 0 ? '+' : '') + g.boost + '%');
+}
+
+function espSetSideFilter(key, side) {
+    if (espTrackedGames[key]) {
+        espTrackedGames[key].sideFilter = side;
+        espRenderTrackedGames();
+    }
+}
+
+function espLog(msg) {
+    const el = document.getElementById('esp-trade-log');
+    if (!el) return;
+    const now = new Date();
+    const ts = now.toLocaleTimeString('en-US', {hour12: false}) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+    el.innerHTML = '<div><span style="color:#555;">' + ts + '</span> ' + msg + '</div>' + el.innerHTML;
+    if (el.children.length > 80) el.removeChild(el.lastChild);
+}
+
+function espToggleMode() {
+    espTradeMode = espTradeMode === 'ioc' ? 'maker' : 'ioc';
+    const btn = document.getElementById('esp-mode-btn');
+    if (espTradeMode === 'maker') {
+        btn.textContent = 'MAKER'; btn.style.background = '#1a237e'; btn.style.color = '#7986cb'; btn.style.borderColor = '#7986cb';
+    } else {
+        btn.textContent = 'IOC'; btn.style.background = '#333'; btn.style.color = '#ffa726'; btn.style.borderColor = '#ffa726';
+    }
+}
+
+function espToggleTrade() {
+    if (espTrading) espStopTrade(); else espStartTrade();
+}
+
+function espStartTrade() {
+    espTrading = true;
+    for (const g of Object.values(espTrackedGames)) { g.lastHomeOdds = null; g.lastAwayOdds = null; g.baseHomeLabel = null; g.baseAwayLabel = null; g.tradeBusy = false; g.locked = false; if (g.makerTimer) { clearTimeout(g.makerTimer); g.makerTimer = null; } g.pendingMakerFair = null; }
+    const btn = document.getElementById('esp-trade-btn');
+    btn.textContent = 'TRADE OFF'; btn.style.background = '#b71c1c'; btn.style.color = '#ff5252'; btn.style.borderColor = '#ff5252';
+    const log = document.getElementById('esp-trade-log');
+    if (log) { log.style.display = ''; log.innerHTML = ''; }
+    espLog('<span style="color:#66bb6a;">TRADING ON</span> mode=' + espTradeMode);
+    if (!espTradePoll) {
+        fetch('/api/st_start', {method: 'POST'});
+        espTradePoll = setInterval(espPollAll, 60);
+    }
+}
+
+async function espStopTrade() {
+    espTrading = false;
+    const btn = document.getElementById('esp-trade-btn');
+    btn.textContent = 'TRADE ON'; btn.style.background = '#1b5e20'; btn.style.color = '#66bb6a'; btn.style.borderColor = '#66bb6a';
+    espLog('<span style="color:#ff5252;">TRADING OFF</span>');
+    try {
+        const promises = [];
+        for (const g of Object.values(espTrackedGames)) {
+            if (g.makerTimer) { clearTimeout(g.makerTimer); g.makerTimer = null; }
+            g.pendingMakerFair = null;
+            const gm = g.game;
+            if (gm.tickers && gm.tickers.length) {
+                promises.push(fetch('/api/cancel_all', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({tickers: gm.tickers}),
+                }));
+            }
+            if (gm.polySeriesTickers && gm.polySeriesTickers.length) {
+                const tokenIds = [];
+                for (const t of gm.polySeriesTickers) { tokenIds.push(t.token_a); tokenIds.push(t.token_b); }
+                promises.push(fetch('/api/poly_cancel_all', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({token_ids: tokenIds}),
+                }));
+            }
+        }
+        await Promise.all(promises);
+    } catch(e) {}
+}
+
+// ── Poll loop ──
+async function espPollAll() {
+    const entries = Object.entries(espTrackedGames);
+    if (entries.length === 0) return;
+
+    if (espTrading) {
+        fetch('/api/ws_status').then(r => r.json()).then(ws => {
+            const el = document.getElementById('esp-ws-status');
+            if (el) {
+                el.textContent = ws.connected ? 'WS:ON' : 'WS:OFF';
+                el.style.color = ws.connected ? '#66bb6a' : '#ef5350';
+            }
+            if (ws.fills && ws.fills.length > espLastWsFillCount) {
+                const newFills = ws.fills.slice(espLastWsFillCount);
+                espLastWsFillCount = ws.fills.length;
+                for (const f of newFills) {
+                    const tag = f.is_taker ? 'TAKER' : 'MAKER';
+                    espLog('<span style="color:#ff9800;">[WS FILL] ' + tag + ' ' + f.side + ' ' + f.count + '@' + f.price + ' ' + f.ticker.split('-').pop() + '</span>');
+                    playFillSound();
+                }
+            }
+        }).catch(() => {});
+    }
+
+    try {
+        const resp = await fetch('/api/st_state');
+        const state = await resp.json();
+        const odds = state.odds || {};
+        const labels = state.labels || {};
+
+        if (espTrading) {
+            for (const [key, g] of entries) {
+                const hl = labels[key + '_home_label'];
+                const al = labels[key + '_away_label'];
+                if (hl != null && g.baseHomeLabel == null) { g.baseHomeLabel = hl; espLog('Label baseline set: <span style="color:#ffa726;">' + hl + '</span>'); }
+                if (al != null && g.baseAwayLabel == null) { g.baseAwayLabel = al; espLog('Label baseline set: <span style="color:#ffa726;">' + al + '</span>'); }
+                if (g.baseHomeLabel != null && hl != null && hl !== g.baseHomeLabel) {
+                    espLog('<span style="color:#ff5252;">LABEL SHIFT: "' + hl + '" != "' + g.baseHomeLabel + '" — STOPPING</span>');
+                    espStopTrade(); playShiftAlarm(); return;
+                }
+                if (g.baseAwayLabel != null && al != null && al !== g.baseAwayLabel) {
+                    espLog('<span style="color:#ff5252;">LABEL SHIFT: "' + al + '" != "' + g.baseAwayLabel + '" — STOPPING</span>');
+                    espStopTrade(); playShiftAlarm(); return;
+                }
+            }
+        }
+
+        for (const [key, g] of entries) {
+            const ho = odds[key + '_home'];
+            const ao = odds[key + '_away'];
+            const safeKey = key.replace(/[|\\]/g, '_');
+
+            if ((ho == null || ao == null) && espTrading && g.lastHomeOdds != null) {
+                const locked = ho == null && ao == null ? 'BOTH' : (ho == null ? 'HOME' : 'AWAY');
+                if (!g.locked) {
+                    espLog('<span style="color:#ff5252;font-weight:bold;">LOCKED (' + locked + ') — EMERGENCY CANCEL ' + key + '</span>');
+                    g.locked = true;
+                }
+                if (g.makerTimer) { clearTimeout(g.makerTimer); g.makerTimer = null; }
+                g.pendingMakerFair = null;
+                g.tradeBusy = true;
+                const gm = g.game;
+                if (gm.tickers && gm.tickers.length) {
+                    fetch('/api/cancel_all', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({tickers: gm.tickers}),
+                    }).then(() => {
+                        espLog('<span style="color:#ffa726;">CANCEL CONFIRMED for ' + key + '</span>');
+                    }).catch(() => {}).finally(() => { g.tradeBusy = false; });
+                } else {
+                    g.tradeBusy = false;
+                }
+            }
+            if (ho != null && ao != null) {
+                if (g.locked) {
+                    espLog('<span style="color:#66bb6a;font-weight:bold;">UNLOCKED ' + key + '</span> odds=' + ho.toFixed(2) + '/' + ao.toFixed(2));
+                    g.locked = false;
+                }
+                const fair = powerDevig(ho, ao);
+                const boost = g.boost || 0;
+                const hf = Math.max(1, Math.min(99, Math.round(fair.home * 100) + boost));
+                const af = 100 - hf;
+                const rawH = document.getElementById('esp-tg-raw-' + safeKey + '-h');
+                const rawA = document.getElementById('esp-tg-raw-' + safeKey + '-a');
+                const fairH = document.getElementById('esp-tg-fair-' + safeKey + '-h');
+                const fairA = document.getElementById('esp-tg-fair-' + safeKey + '-a');
+                if (rawH) rawH.textContent = ho.toFixed(2);
+                if (rawA) rawA.textContent = ao.toFixed(2);
+                if (fairH) fairH.textContent = hf + 'c' + (boost ? ' (' + (boost > 0 ? '+' : '') + boost + ')' : '');
+                if (fairA) fairA.textContent = af + 'c';
+
+                if (espTrading && (ho !== g.lastHomeOdds || ao !== g.lastAwayOdds)) {
+                    let tradeSide = 'both';
+                    const contracts = parseInt(document.getElementById('esp-contracts').value);
+                    const spread = parseInt(document.getElementById('esp-spread').value);
+                    if (espTradeMode === 'ioc') {
+                        if (g.lastHomeOdds != null && g.lastAwayOdds != null) {
+                            const homeShortened = ho < g.lastHomeOdds;
+                            const awayShortened = ao < g.lastAwayOdds;
+                            if (homeShortened && !awayShortened) tradeSide = 'home';
+                            else if (awayShortened && !homeShortened) tradeSide = 'away';
+                            else if (!homeShortened && !awayShortened) tradeSide = 'none';
+                            espLog('Odds moved ' + ho.toFixed(2) + '/' + ao.toFixed(2)
+                                + (homeShortened ? ' <span style="color:#4caf50;">H&darr;</span>' : '')
+                                + (awayShortened ? ' <span style="color:#ef5350;">A&darr;</span>' : '')
+                                + ' &rarr; ' + tradeSide);
+                        } else {
+                            tradeSide = 'none';
+                            espLog('Baseline set ' + ho.toFixed(2) + '/' + ao.toFixed(2) + ' fair=' + hf + '/' + af);
+                        }
+                    } else {
+                        espLog('Odds moved ' + ho.toFixed(2) + '/' + ao.toFixed(2) + ' fair=' + hf + '/' + af + ' &rarr; reprice');
+                    }
+                    g.lastHomeOdds = ho; g.lastAwayOdds = ao;
+                    const sf = g.sideFilter || 'both';
+                    if (sf !== 'both') {
+                        if (tradeSide === 'both') tradeSide = sf;
+                        else if (tradeSide !== sf) tradeSide = 'none';
+                    }
+                    if (tradeSide !== 'none' && espTradeMode === 'maker') {
+                        const gm = g.game;
+                        if (gm.tickers && gm.tickers.length) {
+                            fetch('/api/cancel_all', {
+                                method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({tickers: gm.tickers}),
+                            }).catch(() => {});
+                            espLog('<span style="color:#ffb74d;">CANCELED — reposting</span>');
+                        }
+                        if (g.makerTimer) clearTimeout(g.makerTimer);
+                        g.pendingMakerFair = {hf, af, tradeSide};
+                        g.makerTimer = setTimeout(() => {
+                            g.makerTimer = null;
+                            const pm = g.pendingMakerFair;
+                            if (!pm || g.tradeBusy) return;
+                            g.tradeBusy = true;
+                            espLog('<span style="color:#e040fb;">POSTING MAKER</span> side=' + pm.tradeSide + ' fair=' + pm.hf + '/' + pm.af);
+                            fetch('/api/screen_trade', {
+                                method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({
+                                    home: gm.home, away: gm.away,
+                                    tickers: gm.tickers,
+                                    poly_tickers: gm.polySeriesTickers,
+                                    contracts: contracts, spread_cents: spread,
+                                    game_key: key,
+                                    trade_side: pm.tradeSide,
+                                    mode: 'maker',
+                                    home_fair_cents: pm.hf,
+                                }),
+                            }).then(r => r.json()).then(d => {
+                                if (d.orders && d.orders.length) {
+                                    const fills = d.orders.filter(o => o.status === 'filled' || (o.filled && o.filled > 0));
+                                    if (fills.length) {
+                                        playFillSound();
+                                        fills.forEach(o => espLog('<span style="color:#66bb6a;">FILLED</span> ' + o.team + ' @' + o.price + 'c'));
+                                    }
+                                }
+                            }).catch(e => { espLog('<span style="color:#ff5252;">ERROR: ' + e + '</span>'); }).finally(() => { g.tradeBusy = false; });
+                        }, 300);
+                    } else if (tradeSide !== 'none' && !g.tradeBusy) {
+                        g.tradeBusy = true;
+                        const gm = g.game;
+                        espLog('<span style="color:#e040fb;">SENDING ' + espTradeMode.toUpperCase() + '</span> side=' + tradeSide + ' fair=' + hf + '/' + af);
+                        fetch('/api/screen_trade', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                home: gm.home, away: gm.away,
+                                tickers: gm.tickers,
+                                poly_tickers: gm.polySeriesTickers,
+                                contracts: contracts, spread_cents: spread,
+                                game_key: key,
+                                trade_side: tradeSide,
+                                mode: espTradeMode,
+                                home_fair_cents: hf,
+                            }),
+                        }).then(r => r.json()).then(d => {
+                            if (d.orders && d.orders.length) {
+                                const fills = d.orders.filter(o => o.status === 'filled' || (o.filled && o.filled > 0));
+                                if (fills.length) {
+                                    playFillSound();
+                                    fills.forEach(o => espLog('<span style="color:#66bb6a;">FILLED</span> ' + o.team + ' @' + o.price + 'c'));
+                                }
+                            }
+                        }).catch(e => { espLog('<span style="color:#ff5252;">ERROR: ' + e + '</span>'); }).finally(() => { g.tradeBusy = false; });
+                    } else if (tradeSide === 'none') {
+                        espLog('<span style="color:#555;">no trade (side=none)</span>');
+                    } else if (g.tradeBusy) {
+                        espLog('<span style="color:#555;">skipped (busy)</span>');
+                    }
+                }
+            }
+        }
     } catch(e) {}
 }
 </script>
@@ -6663,17 +8163,21 @@ def _cancel_poly_tokens(poly_tickers):
 
 
 def _post_poly_live_orders(poly_tickers, home_fair_cents, home, away,
-                           contracts, spread_cents, ioc=False):
+                           contracts, spread_cents, ioc=False, trade_side='both'):
     orders = []
     away_fair_cents = 100 - home_fair_cents
-    closeness = min(home_fair_cents, away_fair_cents) / 50.0
-    adj_spread = max(1, int(round(spread_cents * (0.5 + 0.5 * closeness))))
-    home_spread_bid = home_fair_cents - adj_spread
-    away_spread_bid = away_fair_cents - adj_spread
+    home_spread = _shrink_spread(spread_cents, home_fair_cents)
+    away_spread = _shrink_spread(spread_cents, away_fair_cents)
+    home_spread_bid = home_fair_cents - home_spread
+    away_spread_bid = away_fair_cents - away_spread
     skip_home = home_spread_bid < 1
     skip_away = away_spread_bid < 1
+    if trade_side == 'home':
+        skip_away = True
+    elif trade_side == 'away':
+        skip_home = True
 
-    print(f"[POLY {'IOC' if ioc else 'POST'}] fair={home_fair_cents}c spread={adj_spread}c (base={spread_cents}c) "
+    print(f"[POLY {'IOC' if ioc else 'POST'}] fair={home_fair_cents}c home_spread={home_spread}c away_spread={away_spread}c (base={spread_cents}c) "
           f"-> home_bid={home_spread_bid}c{'(SKIP)' if skip_home else ''} "
           f"away_bid={away_spread_bid}c{'(SKIP)' if skip_away else ''} "
           f"contracts={contracts} shares")
@@ -6692,7 +8196,13 @@ def _post_poly_live_orders(poly_tickers, home_fair_cents, home, away,
         # token_a corresponds to team_a, token_b to team_b.
         home_lower = home.lower()
         away_lower = away.lower()
-        if team_a.lower() == home_lower or team_b.lower() == away_lower:
+        ph = (poly_home or '').lower()
+        pa = (poly_away or '').lower()
+        if ph == home_lower or pa == away_lower:
+            is_model_home_a = True
+        elif ph == away_lower or pa == home_lower:
+            is_model_home_a = False
+        elif team_a.lower() == home_lower or team_b.lower() == away_lower:
             is_model_home_a = True
         elif team_b.lower() == home_lower or team_a.lower() == away_lower:
             is_model_home_a = False
@@ -6986,6 +8496,9 @@ def _compute_and_post(data, cancel_first=False, post_orders_flag=True, ioc=False
     }
 
     poly_tickers = data.get('poly_tickers', [])
+
+    if KALSHI_WS and tickers:
+        KALSHI_WS.subscribe([t['ticker'] for t in tickers if 'ticker' in t])
 
     if cancel_first:
         ticker_names = [t['ticker'] for t in tickers if 'ticker' in t]
@@ -8723,6 +10236,235 @@ def api_swiss_simulate():
     return jsonify({'stages': result_stages, 'sims': n_sims})
 
 
+# ── Kalshi WebSocket API ─────────────────────────────────────────────
+
+@app.route('/api/ws_status')
+def api_ws_status():
+    if not KALSHI_WS:
+        return jsonify({'connected': False, 'tickers': [], 'fills': []})
+    with KALSHI_WS_FILLS_LOCK:
+        recent = list(KALSHI_WS_FILLS[-20:])
+    return jsonify({
+        'connected': KALSHI_WS.connected,
+        'tickers': list(KALSHI_WS.subscribed_tickers),
+        'fills': recent,
+    })
+
+
+@app.route('/api/ws_subscribe', methods=['POST'])
+def api_ws_subscribe():
+    if not KALSHI_WS:
+        return jsonify({'error': 'WebSocket not available'}), 400
+    data = request.get_json(force=True)
+    tickers = data.get('tickers', [])
+    if tickers:
+        KALSHI_WS.subscribe(tickers)
+    return jsonify({'ok': True, 'subscribed': list(KALSHI_WS.subscribed_tickers)})
+
+
+# ── Esports Market Fetch API ──────────────────────────────────────────
+
+ESPORT_KALSHI_SERIES = {
+    'valorant': ['KXVALWIN'],
+    'lol': ['KXLOLWIN'],
+    'dota2': ['KXDOTAWIN'],
+}
+
+ESPORT_POLY_SLUGS = {
+    'valorant': 'valorant',
+    'lol': 'league-of-legends',
+    'dota2': 'dota-2',
+}
+
+
+def _fetch_esport_kalshi_markets(esport):
+    series_list = ESPORT_KALSHI_SERIES.get(esport, [])
+    if not series_list:
+        return []
+    all_markets = []
+    for series in series_list:
+        cursor = None
+        while True:
+            params = {'series_ticker': series, 'status': 'open', 'limit': 200}
+            if cursor:
+                params['cursor'] = cursor
+            try:
+                hdrs = make_auth_headers(PRIVATE_KEY, API_KEY_ID, 'GET',
+                                        '/trade-api/v2/markets') if PRIVATE_KEY else {}
+                resp = http_requests.get(f"{KALSHI_BASE}/markets", headers=hdrs,
+                                        params=params, timeout=10)
+            except Exception as e:
+                print(f"  [Esport] Kalshi API error ({series}): {e}")
+                break
+            if resp.status_code != 200:
+                print(f"  [Esport] Kalshi API {resp.status_code} for {series}")
+                break
+            data = resp.json()
+            batch = data.get('markets', [])
+            for m in batch:
+                if m.get('status', '').lower() in ('closed', 'settled', 'finalized'):
+                    continue
+                all_markets.append(m)
+            cursor = data.get('cursor', '')
+            if not cursor or not batch:
+                break
+    return all_markets
+
+
+def _fetch_esport_poly_markets(esport):
+    slug = ESPORT_POLY_SLUGS.get(esport)
+    if not slug:
+        return []
+    events = []
+    try:
+        for offset in range(0, 2000, 100):
+            resp = http_requests.get(f"{GAMMA_BASE}/events",
+                                    params={'series_slug': slug,
+                                            'closed': 'false', 'limit': 100,
+                                            'offset': offset},
+                                    timeout=15)
+            if resp.status_code != 200:
+                break
+            batch = resp.json()
+            events.extend(batch)
+            if len(batch) < 100:
+                break
+    except Exception as e:
+        print(f"  [Esport] Poly API error ({slug}): {e}")
+    return events
+
+
+@app.route('/api/esports/fetch_games', methods=['POST'])
+def api_esports_fetch_games():
+    data = request.get_json(force=True) or {}
+    esport = data.get('esport', '')
+    if esport not in ESPORT_KALSHI_SERIES:
+        return jsonify({'error': f'Unknown esport: {esport}', 'games': []})
+
+    result = {}
+
+    kalshi_markets = _fetch_esport_kalshi_markets(esport)
+    for m in kalshi_markets:
+        title = m.get('title', '') or ''
+        subtitle = m.get('subtitle', '') or ''
+
+        away_k, home_k = None, None
+        for text in [title, subtitle]:
+            match = re.search(r'the\s+(.+?)\s+vs\.?\s+(.+?)\s+(?:\w+\s+)?match', text, re.IGNORECASE)
+            if match:
+                away_k, home_k = match.group(1).strip(), match.group(2).strip()
+                break
+            text_clean = re.sub(r'\s*(Map\s*\d\s+Winner|Winner|Match Winner)\s*\??\s*$', '', text,
+                               flags=re.IGNORECASE).strip()
+            match2 = re.match(r'^(.+?)\s+(?:at|vs\.?)\s+(.+?)$', text_clean, re.IGNORECASE)
+            if match2:
+                away_k, home_k = match2.group(1).strip(), match2.group(2).strip()
+                break
+        if not away_k or not home_k:
+            continue
+
+        ticker = m.get('ticker', '')
+        key = (home_k, away_k)
+        if key not in result:
+            result[key] = {
+                'home': home_k, 'away': away_k,
+                'tickers': [], 'polySeriesTickers': [],
+            }
+
+        yes_team = home_k
+        match_yes = re.match(r'^Will\s+(.+?)\s+win\b', title, re.IGNORECASE)
+        if match_yes:
+            yes_name = match_yes.group(1).strip()
+            if yes_name.lower() == away_k.lower():
+                yes_team = away_k
+            else:
+                yes_team = home_k
+        home_is_yes = (yes_team == home_k)
+
+        result[key]['tickers'].append({
+            'ticker': ticker,
+            'home_is_yes': home_is_yes,
+            'yes_team': home_k if home_is_yes else away_k,
+            'no_team': away_k if home_is_yes else home_k,
+        })
+
+    poly_events = _fetch_esport_poly_markets(esport)
+    for event in poly_events:
+        if event.get('closed'):
+            continue
+        for mkt in event.get('markets', []):
+            if mkt.get('sportsMarketType') != 'moneyline':
+                continue
+            outcomes = json.loads(mkt.get('outcomePrices', '[]'))
+            if outcomes in [['0', '1'], ['1', '0']]:
+                continue
+            outcome_names = mkt.get('outcomes', '')
+            if isinstance(outcome_names, str):
+                try:
+                    outcome_names = json.loads(outcome_names)
+                except Exception:
+                    outcome_names = []
+            if len(outcome_names) < 2:
+                continue
+            team_a, team_b = outcome_names[0], outcome_names[1]
+            tokens = json.loads(mkt.get('clobTokenIds', '[]'))
+            if len(tokens) < 2:
+                continue
+
+            q = mkt.get('question', '') or event.get('title', '') or ''
+            match_vs = re.search(r'(.+?)\s+vs\.?\s+(.+)', q, re.IGNORECASE)
+            if match_vs:
+                away_p, home_p = match_vs.group(1).strip(), match_vs.group(2).strip()
+            else:
+                away_p, home_p = team_a, team_b
+
+            away_p = re.sub(r'\s*\(.*?\)\s*$', '', away_p).strip()
+            home_p = re.sub(r'\s*\(.*?\)\s*$', '', home_p).strip()
+            away_p = re.sub(r'^(?:Will\s+)', '', away_p, flags=re.IGNORECASE).strip()
+
+            key = (home_p, away_p)
+            rkey = (away_p, home_p)
+            if rkey in result and key not in result:
+                key = rkey
+            if key not in result:
+                result[key] = {
+                    'home': key[0], 'away': key[1],
+                    'tickers': [], 'polySeriesTickers': [],
+                }
+
+            price_a = float(outcomes[0]) if len(outcomes) > 0 else 0
+            price_b = float(outcomes[1]) if len(outcomes) > 1 else 0
+            result[key]['polySeriesTickers'].append({
+                'token_a': tokens[0], 'token_b': tokens[1],
+                'team_a': team_a, 'team_b': team_b,
+                'home_team': key[0], 'away_team': key[1],
+                'price_a': price_a, 'price_b': price_b,
+                'title': mkt.get('question', ''),
+                'platform': 'poly',
+                'tick_size': float(mkt.get('minimum_tick_size', '0.01')),
+                'neg_risk': mkt.get('negRisk', False),
+            })
+
+    games = []
+    for key, g in result.items():
+        home_prob = 0.5
+        if g['tickers']:
+            pass
+        games.append({
+            'home': g['home'],
+            'away': g['away'],
+            'home_prob': home_prob,
+            'tickers': g['tickers'],
+            'polySeriesTickers': g['polySeriesTickers'],
+        })
+
+    games.sort(key=lambda g: g['away'].lower())
+    print(f"  [Esport] {esport}: found {len(games)} games "
+          f"({sum(len(g['tickers']) for g in games)} Kalshi, "
+          f"{sum(len(g['polySeriesTickers']) for g in games)} Poly)")
+    return jsonify({'games': games, 'esport': esport})
+
+
 # ── Screen Tracker API ───────────────────────────────────────────────
 
 @app.route('/api/st_screenshot', methods=['POST'])
@@ -8764,9 +10506,55 @@ def api_st_capture_once():
     return jsonify(result)
 
 
+_st_prev_odds = {}
+_st_prev_odds_lock = threading.Lock()
+
+
+def _screen_tracker_on_update(state):
+    """Server-side callback: cancel orders instantly when odds go null (locked)."""
+    global _st_prev_odds
+    odds = state.get('odds', {})
+    with _st_prev_odds_lock:
+        for key in list(_st_prev_odds.keys()):
+            if key.endswith('_home'):
+                base = key[:-5]
+                prev_h = _st_prev_odds.get(base + '_home')
+                prev_a = _st_prev_odds.get(base + '_away')
+                curr_h = odds.get(base + '_home')
+                curr_a = odds.get(base + '_away')
+                if prev_h is not None and prev_a is not None:
+                    if curr_h is None or curr_a is None:
+                        locked = 'BOTH' if curr_h is None and curr_a is None else ('HOME' if curr_h is None else 'AWAY')
+                        print(f"[SCREEN-LOCK] {base} LOCKED ({locked}) — server-side emergency cancel")
+                        _emergency_cancel_all()
+                        break
+        _st_prev_odds = dict(odds)
+
+
+def _emergency_cancel_all():
+    """Cancel all tracked Kalshi orders immediately from server side."""
+    def _do():
+        with PLACED_ORDER_LOCK:
+            oids = [o['oid'] for o in PLACED_ORDER_IDS]
+        if not oids:
+            return
+        cancelled = 0
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {pool.submit(_cancel_single_order, oid): oid for oid in oids}
+            for f in as_completed(futs):
+                if f.result():
+                    cancelled += 1
+        with PLACED_ORDER_LOCK:
+            cancelled_set = set(oids)
+            PLACED_ORDER_IDS[:] = [o for o in PLACED_ORDER_IDS
+                                   if o['oid'] not in cancelled_set]
+        print(f"[SCREEN-LOCK] Cancelled {cancelled}/{len(oids)} Kalshi orders")
+    threading.Thread(target=_do, daemon=True).start()
+
+
 @app.route('/api/st_start', methods=['POST'])
 def api_st_start():
-    SCREEN_TRACKER.start(interval=0.15)
+    SCREEN_TRACKER.start(interval=0.08, on_update=_screen_tracker_on_update)
     return jsonify({'ok': True})
 
 
@@ -8822,6 +10610,8 @@ def api_screen_trade():
     poly_tickers = data.get('poly_tickers', [])
     contracts = data.get('contracts', CONTRACTS)
     spread_cents = data.get('spread_cents', SPREAD_CENTS)
+    trade_side = data.get('trade_side', 'both')
+    mode = data.get('mode', 'ioc')
 
     game_key = data.get('game_key', f"{home}|{away}")
     state = SCREEN_TRACKER.get_state()
@@ -8831,27 +10621,42 @@ def api_screen_trade():
     if not home_odds or not away_odds:
         return jsonify({'error': 'No odds from screen tracker', 'orders': []}), 400
 
-    home_fair_prob, away_fair_prob = power_devig(home_odds, away_odds)
-    home_fair_cents = int(round(home_fair_prob * 100))
-    home_fair_cents = max(1, min(99, home_fair_cents))
+    client_fair = data.get('home_fair_cents')
+    if client_fair is not None:
+        home_fair_cents = max(1, min(99, int(client_fair)))
+    else:
+        home_fair_prob, away_fair_prob = power_devig(home_odds, away_odds)
+        home_fair_cents = int(round(home_fair_prob * 100))
+        home_fair_cents = max(1, min(99, home_fair_cents))
 
-    print(f"[SCREEN-TRADE] {game_key} odds={home_odds}/{away_odds} -> "
-          f"fair={home_fair_cents}c/{100 - home_fair_cents}c spread={spread_cents}c")
+    print(f"[SCREEN-TRADE] {game_key} mode={mode} odds={home_odds}/{away_odds} -> "
+          f"fair={home_fair_cents}c/{100 - home_fair_cents}c spread={spread_cents}c side={trade_side}")
+
+    if KALSHI_WS and tickers:
+        KALSHI_WS.subscribe([t['ticker'] for t in tickers if 'ticker' in t])
 
     results = []
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = []
+    if mode == 'maker':
         if tickers:
-            futures.append(pool.submit(post_ioc_orders,
+            ticker_names = [t['ticker'] for t in tickers]
+            cancel_all_live_orders(tickers=ticker_names)
+            results.extend(post_live_orders(
                 tickers, home_fair_cents, contracts, spread_cents,
-                home, away))
-        if poly_tickers:
-            futures.append(pool.submit(_post_poly_live_orders,
-                poly_tickers, home_fair_cents, home, away,
-                contracts, spread_cents, True))
-        for f in as_completed(futures):
-            results.extend(f.result())
+                home, away, trade_side))
+    else:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = []
+            if tickers:
+                futures.append(pool.submit(post_ioc_orders,
+                    tickers, home_fair_cents, contracts, spread_cents,
+                    home, away, trade_side))
+            if poly_tickers:
+                futures.append(pool.submit(_post_poly_live_orders,
+                    poly_tickers, home_fair_cents, home, away,
+                    contracts, spread_cents, True, trade_side))
+            for f in as_completed(futures):
+                results.extend(f.result())
 
     return jsonify({
         'home_odds': home_odds,
@@ -8865,7 +10670,7 @@ def api_screen_trade():
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
-    global API_KEY_ID, PRIVATE_KEY, DRY_RUN, CONTRACTS, SPREAD_CENTS, POLY_CLIENT
+    global API_KEY_ID, PRIVATE_KEY, DRY_RUN, CONTRACTS, SPREAD_CENTS, POLY_CLIENT, KALSHI_WS
 
     parser = argparse.ArgumentParser(description="CS2 Live Trader")
     parser.add_argument('--api-key-id', type=str, default=None)
@@ -8887,6 +10692,9 @@ def main():
             sys.exit(1)
         API_KEY_ID = args.api_key_id
         PRIVATE_KEY = load_private_key(args.private_key_path)
+
+        KALSHI_WS = KalshiWS(API_KEY_ID, PRIVATE_KEY)
+        KALSHI_WS.start(on_fill=_ws_fill_handler)
     else:
         API_KEY_ID = 'dry-run'
 
@@ -8897,10 +10705,12 @@ def main():
     global HLTV_SCRAPER
     HLTV_SCRAPER = HLTVScoreboard()
 
+    ws_status = 'connected' if KALSHI_WS else 'off (dry-run)'
     print(f"\n  CS2 Live Trader")
     print(f"  Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}")
     print(f"  Contracts: {CONTRACTS} | Spread: {SPREAD_CENTS}c")
     print(f"  Polymarket: {'connected' if POLY_CLIENT else 'off'}")
+    print(f"  Kalshi WS: {ws_status}")
     print(f"  http://localhost:{args.port}\n")
 
     app.run(host='0.0.0.0', port=args.port, debug=False)

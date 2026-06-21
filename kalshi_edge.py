@@ -40,6 +40,16 @@ PREGAME_CUTOFF_MINS = 15
 CONFIDENT_MATCHES = 30  # sample size at which model uncertainty is "normal"
 
 
+def time_based_spread_multiplier(hours_to_start):
+    """Scale spread based on time to match start.
+    >24h: 3x, 12-24h: 2x, <12h: 1x."""
+    if hours_to_start is None or hours_to_start <= 12:
+        return 1.0
+    if hours_to_start <= 24:
+        return 2.0
+    return 3.0
+
+
 def sample_size_spread_multiplier(home_count, away_count):
     """Widen spread for low-sample-size games. Returns multiplier >= 1.0.
 
@@ -926,18 +936,22 @@ def fetch_orderbook_best_ask(ticker):
 
 
 def place_limit_order(api_key_id, private_key, ticker, side, count, price_cents, dry_run=False, expiration_ts=None, client_order_id=None):
-    path = '/trade-api/v2/portfolio/orders'
-    url = KALSHI_BASE + '/portfolio/orders'
-    yes_price = price_cents if side == 'yes' else (100 - price_cents)
+    path = '/trade-api/v2/portfolio/events/orders'
+    url = KALSHI_BASE + '/portfolio/events/orders'
+    v2_side = 'bid' if side == 'yes' else 'ask'
+    yes_price_cents = price_cents if side == 'yes' else (100 - price_cents)
+    v2_price = f"{yes_price_cents / 100:.4f}"
     if client_order_id is None:
         client_order_id = f"mm-{uuid.uuid4()}"
     order = {
-        'ticker': ticker, 'action': 'buy', 'side': side,
-        'count': count, 'type': 'limit', 'yes_price': yes_price,
+        'ticker': ticker, 'side': v2_side,
+        'count': str(count), 'price': v2_price,
+        'time_in_force': 'good_till_canceled',
+        'self_trade_prevention_type': 'maker',
         'client_order_id': client_order_id,
     }
     if expiration_ts:
-        order['expiration_ts'] = expiration_ts
+        order['expiration_time'] = expiration_ts
     if dry_run:
         cost = count * price_cents / 100
         print(f"      [DRY RUN] BID {count} {side.upper()} @ {price_cents}c | cost if filled: ${cost:.2f}")
@@ -953,9 +967,11 @@ def place_limit_order(api_key_id, private_key, ticker, side, count, price_cents,
             print(f"      FAILED after 3 attempts: {e}")
             return False
         if resp.status_code == 201:
-            oid = resp.json().get('order', {}).get('order_id', '')
-            status = resp.json().get('order', {}).get('status', '?')
-            print(f"      ORDER PLACED (id={oid}, status={status})")
+            data = resp.json()
+            oid = data.get('order_id', '')
+            remaining = data.get('remaining_count', '0')
+            filled = data.get('fill_count', '0')
+            print(f"      ORDER PLACED (id={oid}, filled={filled}, remaining={remaining})")
             return oid or True
         elif resp.status_code == 429 and attempt < 2:
             time.sleep(1.0 * (attempt + 1))
@@ -967,14 +983,17 @@ def place_limit_order(api_key_id, private_key, ticker, side, count, price_cents,
 
 
 def place_ioc_order(api_key_id, private_key, ticker, side, count, price_cents, dry_run=False):
-    path = '/trade-api/v2/portfolio/orders'
-    url = KALSHI_BASE + '/portfolio/orders'
-    yes_price = price_cents if side == 'yes' else (100 - price_cents)
+    path = '/trade-api/v2/portfolio/events/orders'
+    url = KALSHI_BASE + '/portfolio/events/orders'
+    v2_side = 'bid' if side == 'yes' else 'ask'
+    yes_price_cents = price_cents if side == 'yes' else (100 - price_cents)
+    v2_price = f"{yes_price_cents / 100:.4f}"
     order = {
-        'ticker': ticker, 'action': 'buy', 'side': side,
-        'count': count, 'type': 'limit', 'yes_price': yes_price,
+        'ticker': ticker, 'side': v2_side,
+        'count': str(count), 'price': v2_price,
         'client_order_id': str(uuid.uuid4()),
         'time_in_force': 'immediate_or_cancel',
+        'self_trade_prevention_type': 'maker',
     }
     if dry_run:
         cost = count * price_cents / 100
@@ -985,8 +1004,8 @@ def place_ioc_order(api_key_id, private_key, ticker, side, count, price_cents, d
     headers = make_auth_headers(private_key, api_key_id, 'POST', path)
     resp = requests.post(url, headers=headers, json=order, timeout=10)
     if resp.status_code == 201:
-        order_data = resp.json().get('order', {})
-        fill_count = order_data.get('fill_count', 0)
+        data = resp.json()
+        fill_count = int(float(data.get('fill_count', '0')))
         if fill_count > 0:
             print(f"    FILLED {fill_count}/{count} @ {price_cents}c")
             return fill_count
@@ -1000,8 +1019,8 @@ def place_ioc_order(api_key_id, private_key, ticker, side, count, price_cents, d
 
 def _cancel_order_with_retry(api_key_id, private_key, oid, max_retries=3):
     for attempt in range(max_retries):
-        cancel_path = f'/trade-api/v2/portfolio/orders/{oid}'
-        cancel_url = KALSHI_BASE + f'/portfolio/orders/{oid}'
+        cancel_path = f'/trade-api/v2/portfolio/events/orders/{oid}'
+        cancel_url = KALSHI_BASE + f'/portfolio/events/orders/{oid}'
         hdrs = make_auth_headers(private_key, api_key_id, 'DELETE', cancel_path)
         try:
             r = requests.delete(cancel_url, headers=hdrs, timeout=10)
@@ -1472,6 +1491,8 @@ def limit_cmd(args):
 
             match_start = get_match_start_utc(event_markets[0])
             match_exp_ts = int(match_start.timestamp()) if match_start else None
+            hours_to_start = (match_start - now).total_seconds() / 3600 if match_start else None
+            time_mult = time_based_spread_multiplier(hours_to_start)
 
             for market in event_markets:
                 ticker = market.get('ticker', '')
@@ -1501,7 +1522,7 @@ def limit_cmd(args):
                 wide_book = yes_gap > 10 or no_gap > 10
                 base_spread = args.spread * 2 if wide_book else args.spread
                 ss_mult = sample_size_spread_multiplier(home_count, away_count)
-                spread_cents = int(round(base_spread * ss_mult))
+                spread_cents = int(round(base_spread * ss_mult * time_mult))
 
                 yes_target = max(1, fair_yes - spread_cents)
                 no_target = max(1, fair_no - spread_cents)
@@ -1533,6 +1554,8 @@ def limit_cmd(args):
                 ask_info = f" | ask: YES={mkt_yes_ask}c NO={mkt_no_ask}c" if (mkt_yes_ask or mkt_no_ask) else ""
                 print(f"    [{ticker_short}] Fair: YES={fair_yes}c({yes_team}) NO={fair_no}c({no_team}){ask_info}")
                 spread_tag = " [WIDE]" if wide_book else ""
+                if time_mult > 1.0:
+                    spread_tag += f" [T x{time_mult:.0f} {hours_to_start:.0f}h]"
                 if ss_mult > 1.0:
                     spread_tag += f" [SS x{ss_mult:.2f} n={min(home_count, away_count)}]"
                 if not skip_yes:
@@ -1578,7 +1601,7 @@ def limit_cmd(args):
                     print(f"    [POLY] {pm['team_a']} vs {pm['team_b']} starts in {mins_left:.0f}m — cancelled")
                     pm = None
             if pm and pm.get('accepting_orders') and game_room > 0:
-                poly_spread_dec = (args.spread * ss_mult) / 100
+                poly_spread_dec = (args.spread * ss_mult * time_mult) / 100
                 poly_fair_a = round(prob_home, 2)
                 poly_fair_b = round(prob_away, 2)
 
@@ -1681,6 +1704,7 @@ def limit_cmd(args):
                         continue
 
                     t_a, t_b = teams
+
                     home_count = team_match_counts.get(t_a, 0)
                     away_count = team_match_counts.get(t_b, 0)
                     if home_count < MIN_TEAM_MATCHES or away_count < MIN_TEAM_MATCHES:
@@ -1709,7 +1733,9 @@ def limit_cmd(args):
                         fair_a, fair_b = prob_b, prob_a
 
                     ss_mult_po = sample_size_spread_multiplier(home_count, away_count)
-                    poly_spread_dec = (args.spread * ss_mult_po) / 100
+                    po_hours = (gs - now).total_seconds() / 3600 if gs else None
+                    po_time_mult = time_based_spread_multiplier(po_hours)
+                    poly_spread_dec = (args.spread * ss_mult_po * po_time_mult) / 100
                     skip_po_a = (fair_a - poly_spread_dec) < 0.01
                     skip_po_b = (fair_b - poly_spread_dec) < 0.01
                     bid_a = round(max(0.01, fair_a - poly_spread_dec), 2)
@@ -1724,14 +1750,16 @@ def limit_cmd(args):
                         bid_a = min(bid_a, round(ask_a - tick, 2))
                     if ask_b > 0:
                         bid_b = min(bid_b, round(ask_b - tick, 2))
+
                     bid_a = max(0.01, bid_a)
                     bid_b = max(0.01, bid_b)
 
                     poly_room_g = max(0, poly_max_contracts - poly_held_g)
                     p_size_g = min(poly_contracts, poly_room_g, room_g)
                     held_str_g = f" | held P:{poly_held_g}" if poly_held_g else ""
+                    po_time_tag = f" [T x{po_time_mult:.0f} {po_hours:.0f}h]" if po_time_mult > 1.0 else ""
                     print(f"  {pm['team_a']} vs {pm['team_b']}{held_str_g} | "
-                          f"BID {pm['team_a']}={bid_a:.2f} {pm['team_b']}={bid_b:.2f} | ${p_size_g}/side")
+                          f"BID {pm['team_a']}={bid_a:.2f} {pm['team_b']}={bid_b:.2f} | ${p_size_g}/side{po_time_tag}")
 
                     if p_size_g < 5:
                         print(f"    [POLY] room={p_size_g} < min 5 — skip")
@@ -1798,10 +1826,15 @@ def limit_cmd(args):
                 print(f"    [U2.5] {away_m} vs {home_m} | SKIP — live on auto-trader")
                 continue
 
+            ou_match_start = get_match_start_utc(tm)
+            ou_hours = (ou_match_start - now).total_seconds() / 3600 if ou_match_start else None
+            ou_time_mult = time_based_spread_multiplier(ou_hours)
+            ou_eff_spread = int(round(ou_spread * ou_time_mult))
+
             prob_home, _, _ = get_win_prob(model, encoders, home_m, away_m, scale)
             p_under = prob_under_2_5(prob_home)
             fair_under_cents = int(round(p_under * 100))
-            no_target = max(1, fair_under_cents - ou_spread)
+            no_target = max(1, fair_under_cents - ou_eff_spread)
 
             ob = fetch_orderbook_best_ask(ticker)
             mkt_no_ask = ob['no_best_ask'] if ob and ob.get('no_best_ask') else 0
@@ -1822,8 +1855,9 @@ def limit_cmd(args):
             no_contracts = min(args.contracts, args.max_contracts, room)
             no_edge = (p_under - no_bid / 100) / (no_bid / 100) if no_bid > 0 else 0
             ask_str = f" | ask={mkt_no_ask}c" if mkt_no_ask else ""
+            ou_time_tag = f" [T x{ou_time_mult:.0f} {ou_hours:.0f}h]" if ou_time_mult > 1.0 else ""
             print(f"    [U2.5] {away_m} vs {home_m} | fair={fair_under_cents}c"
-                  f" | BID {no_contracts} NO @ {no_bid}c edge={no_edge:+.1%}{ask_str}")
+                  f" | BID {no_contracts} NO @ {no_bid}c edge={no_edge:+.1%}{ask_str}{ou_time_tag}")
 
             ok = place_limit_order(args.api_key_id, private_key, ticker, 'no',
                                    no_contracts, no_bid, args.dry_run,
