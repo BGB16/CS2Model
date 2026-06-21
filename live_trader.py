@@ -2651,6 +2651,14 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
             </div>
         </div>
 
+        <div id="esp-ob-section" style="margin-top:12px;">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
+                <h3 style="color:#e040fb; font-size:13px; margin:0;">Live Orderbooks</h3>
+                <span id="esp-ob-last-update" style="font-size:10px; color:#555;"></span>
+            </div>
+            <div id="esp-ob-content" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(320px, 1fr)); gap:8px;"></div>
+        </div>
+
         <div id="esp-history-section" style="margin-top:12px;">
             <h3 style="color:#aaa; font-size:13px; margin-bottom:6px;">Trade History</h3>
             <div id="esp-history-log" style="max-height:200px; overflow-y:auto; font-family:'SF Mono','Menlo',monospace;
@@ -7482,6 +7490,7 @@ function espClearAll() {
 
 function espShowSbPreview() {
     document.getElementById('esp-sb-section').style.display = '';
+    espRenderMarkButtons();
     espRefreshSbPreview();
     if (espSbPreviewInterval) clearInterval(espSbPreviewInterval);
     espSbPreviewInterval = setInterval(espRefreshSbPreview, 150);
@@ -7518,7 +7527,7 @@ function espRedrawSbCanvas() {
     const sx = canvas.width / espScoreboard.w, sy = canvas.height / espScoreboard.h;
     for (const [key, r] of Object.entries(espSubRegions)) {
         const isLabel = key.endsWith('_label');
-        const isHome = key.includes('_home');
+        const isHome = key.includes('_home') || key.startsWith('home');
         const color = isLabel ? '#ffa726' : (isHome ? '#4caf50' : '#ef5350');
         const gameKey = key.replace(/_(?:home|away)(?:_label)?$/, '');
         const g = espTrackedGames[gameKey];
@@ -7530,7 +7539,7 @@ function espRedrawSbCanvas() {
     }
     if (espSbDrawStart && espSubMode) {
         const isLabel = espSubMode.endsWith('_label');
-        const isHome = espSubMode.includes('_home');
+        const isHome = espSubMode.includes('_home') || espSubMode.startsWith('home');
         ctx.strokeStyle = isLabel ? '#ffa726' : (isHome ? '#4caf50' : '#ef5350'); ctx.lineWidth = 2;
         ctx.setLineDash([4,4]);
         ctx.strokeRect(espSbDrawStart.sx, espSbDrawStart.sy, espSbDrawStart.dx||0, espSbDrawStart.dy||0);
@@ -7570,6 +7579,17 @@ function espRedrawSbCanvas() {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({name: espSubMode, region: region}),
         });
+        const espSubOrder = ['home_odds', 'home_odds_label', 'away_odds', 'away_odds_label'];
+        const genIdx = espSubOrder.indexOf(espSubMode);
+        if (genIdx >= 0 && genIdx < espSubOrder.length - 1) {
+            const nextKey = espSubOrder[genIdx + 1];
+            if (!espSubRegions[nextKey]) {
+                espSubMode = nextKey;
+                espRedrawSbCanvas();
+                espRenderMarkButtons();
+                return;
+            }
+        }
         if (espSubMode.endsWith('_home')) {
             const awayKey = espSubMode.replace(/_home$/, '_away');
             if (!espSubRegions[awayKey]) {
@@ -7589,14 +7609,19 @@ function espRenderMarkButtons() {
     const el = document.getElementById('esp-mark-buttons');
     if (!el) return;
     const keys = Object.keys(espTrackedGames);
-    if (keys.length === 0) { el.innerHTML = ''; return; }
     let html = '';
-    for (const key of keys) {
-        const g = espTrackedGames[key];
-        const homeKey = key + '_home';
-        const awayKey = key + '_away';
-        const homeLabelKey = key + '_home_label';
-        const awayLabelKey = key + '_away_label';
+    if (keys.length === 0) {
+        let homeName = 'Home', awayName = 'Away';
+        const sel = document.getElementById('esp-game-select');
+        const idx = parseInt(sel.value);
+        if (!isNaN(idx) && espAvailableGames[idx]) {
+            homeName = espAvailableGames[idx].home;
+            awayName = espAvailableGames[idx].away;
+        }
+        const homeKey = 'home_odds';
+        const awayKey = 'away_odds';
+        const homeLabelKey = 'home_odds_label';
+        const awayLabelKey = 'away_odds_label';
         const homeSet = !!espSubRegions[homeKey];
         const awaySet = !!espSubRegions[awayKey];
         const homeLabelSet = !!espSubRegions[homeLabelKey];
@@ -7605,24 +7630,56 @@ function espRenderMarkButtons() {
         const awayActive = espSubMode === awayKey;
         const homeLabelActive = espSubMode === homeLabelKey;
         const awayLabelActive = espSubMode === awayLabelKey;
-        html += '<span style="color:#777;font-size:10px;margin-right:2px;">' + g.game.home + ' v ' + g.game.away + ':</span>';
         html += '<button class="esp-sub-btn" data-espsubkey="' + homeKey + '" '
-            + 'style="padding:2px 6px;font-size:10px;background:' + (homeActive ? '#4caf50' : (homeSet ? '#1b5e20' : '#333'))
+            + 'style="padding:3px 10px;font-size:11px;background:' + (homeActive ? '#4caf50' : (homeSet ? '#1b5e20' : '#333'))
             + ';border:1px solid #4caf50;color:' + (homeActive ? '#000' : '#4caf50') + ';border-radius:3px;cursor:pointer;">'
-            + g.game.home + (homeSet ? ' &#10003;' : '') + '</button>';
+            + homeName + (homeSet ? ' &#10003;' : '') + '</button>';
         html += '<button class="esp-sub-btn" data-espsubkey="' + homeLabelKey + '" '
-            + 'style="padding:2px 6px;font-size:10px;background:' + (homeLabelActive ? '#ffa726' : (homeLabelSet ? '#e65100' : '#333'))
+            + 'style="padding:3px 10px;font-size:11px;background:' + (homeLabelActive ? '#ffa726' : (homeLabelSet ? '#e65100' : '#333'))
             + ';border:1px solid #ffa726;color:' + (homeLabelActive ? '#000' : '#ffa726') + ';border-radius:3px;cursor:pointer;">'
-            + 'Lbl' + (homeLabelSet ? ' &#10003;' : '') + '</button>';
+            + homeName + ' Lbl' + (homeLabelSet ? ' &#10003;' : '') + '</button>';
         html += '<button class="esp-sub-btn" data-espsubkey="' + awayKey + '" '
-            + 'style="padding:2px 6px;font-size:10px;background:' + (awayActive ? '#ef5350' : (awaySet ? '#b71c1c' : '#333'))
+            + 'style="padding:3px 10px;font-size:11px;background:' + (awayActive ? '#ef5350' : (awaySet ? '#b71c1c' : '#333'))
             + ';border:1px solid #ef5350;color:' + (awayActive ? '#000' : '#ef5350') + ';border-radius:3px;cursor:pointer;">'
-            + g.game.away + (awaySet ? ' &#10003;' : '') + '</button>';
+            + awayName + (awaySet ? ' &#10003;' : '') + '</button>';
         html += '<button class="esp-sub-btn" data-espsubkey="' + awayLabelKey + '" '
-            + 'style="padding:2px 6px;font-size:10px;background:' + (awayLabelActive ? '#ffa726' : (awayLabelSet ? '#e65100' : '#333'))
+            + 'style="padding:3px 10px;font-size:11px;background:' + (awayLabelActive ? '#ffa726' : (awayLabelSet ? '#e65100' : '#333'))
             + ';border:1px solid #ffa726;color:' + (awayLabelActive ? '#000' : '#ffa726') + ';border-radius:3px;cursor:pointer;">'
-            + 'Lbl' + (awayLabelSet ? ' &#10003;' : '') + '</button>';
-        html += '<span style="margin-right:10px;"></span>';
+            + awayName + ' Lbl' + (awayLabelSet ? ' &#10003;' : '') + '</button>';
+    } else {
+        for (const key of keys) {
+            const g = espTrackedGames[key];
+            const homeKey = key + '_home';
+            const awayKey = key + '_away';
+            const homeLabelKey = key + '_home_label';
+            const awayLabelKey = key + '_away_label';
+            const homeSet = !!espSubRegions[homeKey];
+            const awaySet = !!espSubRegions[awayKey];
+            const homeLabelSet = !!espSubRegions[homeLabelKey];
+            const awayLabelSet = !!espSubRegions[awayLabelKey];
+            const homeActive = espSubMode === homeKey;
+            const awayActive = espSubMode === awayKey;
+            const homeLabelActive = espSubMode === homeLabelKey;
+            const awayLabelActive = espSubMode === awayLabelKey;
+            html += '<span style="color:#777;font-size:10px;margin-right:2px;">' + g.game.home + ' v ' + g.game.away + ':</span>';
+            html += '<button class="esp-sub-btn" data-espsubkey="' + homeKey + '" '
+                + 'style="padding:2px 6px;font-size:10px;background:' + (homeActive ? '#4caf50' : (homeSet ? '#1b5e20' : '#333'))
+                + ';border:1px solid #4caf50;color:' + (homeActive ? '#000' : '#4caf50') + ';border-radius:3px;cursor:pointer;">'
+                + g.game.home + (homeSet ? ' &#10003;' : '') + '</button>';
+            html += '<button class="esp-sub-btn" data-espsubkey="' + homeLabelKey + '" '
+                + 'style="padding:2px 6px;font-size:10px;background:' + (homeLabelActive ? '#ffa726' : (homeLabelSet ? '#e65100' : '#333'))
+                + ';border:1px solid #ffa726;color:' + (homeLabelActive ? '#000' : '#ffa726') + ';border-radius:3px;cursor:pointer;">'
+                + 'Lbl' + (homeLabelSet ? ' &#10003;' : '') + '</button>';
+            html += '<button class="esp-sub-btn" data-espsubkey="' + awayKey + '" '
+                + 'style="padding:2px 6px;font-size:10px;background:' + (awayActive ? '#ef5350' : (awaySet ? '#b71c1c' : '#333'))
+                + ';border:1px solid #ef5350;color:' + (awayActive ? '#000' : '#ef5350') + ';border-radius:3px;cursor:pointer;">'
+                + g.game.away + (awaySet ? ' &#10003;' : '') + '</button>';
+            html += '<button class="esp-sub-btn" data-espsubkey="' + awayLabelKey + '" '
+                + 'style="padding:2px 6px;font-size:10px;background:' + (awayLabelActive ? '#ffa726' : (awayLabelSet ? '#e65100' : '#333'))
+                + ';border:1px solid #ffa726;color:' + (awayLabelActive ? '#000' : '#ffa726') + ';border-radius:3px;cursor:pointer;">'
+                + 'Lbl' + (awayLabelSet ? ' &#10003;' : '') + '</button>';
+            html += '<span style="margin-right:10px;"></span>';
+        }
     }
     html += '<button onclick="espTestAllOCR()" style="padding:2px 6px;font-size:10px;background:#555;border:1px solid #666;color:#ccc;border-radius:3px;cursor:pointer;">Test OCR</button>';
     el.innerHTML = html;
@@ -7645,7 +7702,7 @@ async function espTestAllOCR() {
         const data = await resp.json();
         const odds = data.odds || {};
         for (const [key, g] of Object.entries(espTrackedGames)) {
-            const safeKey = key.replace(/[|\\]/g, '_');
+            const safeKey = key.replace(/\\|/g, '_');
             const ho = odds[key + '_home'], ao = odds[key + '_away'];
             const rawH = document.getElementById('esp-tg-raw-' + safeKey + '-h');
             const rawA = document.getElementById('esp-tg-raw-' + safeKey + '-a');
@@ -7741,10 +7798,15 @@ function espAddSelectedGame() {
     espRenderTrackedGames();
     espRenderMarkButtons();
 
+    if (espScoreboard) {
+        espShowSbPreview();
+    }
+
     if (!espTradePoll) {
         fetch('/api/st_start', {method: 'POST'});
         espTradePoll = setInterval(espPollAll, 60);
     }
+    espStartOB();
 }
 
 function espRemoveGame(key) {
@@ -7760,7 +7822,11 @@ function espRemoveGame(key) {
     espRenderTrackedGames();
     espRenderMarkButtons();
     espRedrawSbCanvas();
-    if (Object.keys(espTrackedGames).length === 0 && espTrading) espStopTrade();
+    if (Object.keys(espTrackedGames).length === 0) {
+        if (espTrading) espStopTrade();
+        espStopOB();
+    }
+    espFetchOB();
 }
 
 const ESP_ESPORT_LABELS = {valorant: 'VAL', lol: 'LoL', dota2: 'Dota'};
@@ -7775,7 +7841,7 @@ function espRenderTrackedGames() {
     for (const key of keys) {
         const g = espTrackedGames[key];
         const sf = g.sideFilter || 'both';
-        const safeKey = key.replace(/[|\\]/g, '_');
+        const safeKey = key.replace(/\\|/g, '_');
         const esport = g.game.esport || 'valorant';
         const espLabel = ESP_ESPORT_LABELS[esport] || esport;
         const espColor = ESP_ESPORT_COLORS[esport] || '#e040fb';
@@ -7826,7 +7892,7 @@ function espAdjustBoost(key, delta) {
     const g = espTrackedGames[key];
     if (!g) return;
     g.boost = Math.max(-20, Math.min(20, (g.boost || 0) + delta));
-    const safeKey = key.replace(/[|\\]/g, '_');
+    const safeKey = key.replace(/\\|/g, '_');
     const el = document.getElementById('esp-tg-boost-' + safeKey);
     if (el) {
         el.textContent = (g.boost > 0 ? '+' + g.boost : g.boost) + '%';
@@ -7841,6 +7907,37 @@ function espSetSideFilter(key, side) {
         espRenderTrackedGames();
     }
 }
+
+async function espFetchOB() {
+    const entries = Object.entries(espTrackedGames);
+    if (entries.length === 0) { const c = document.getElementById('esp-ob-content'); if (c) c.innerHTML = ''; return; }
+    try {
+        const allBooks = [];
+        const promises = [];
+        for (const [key, g] of entries) {
+            const gm = g.game;
+            if (gm.tickers && gm.tickers.length) {
+                promises.push(fetch('/api/orderbook', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({tickers: gm.tickers}),
+                }).then(r => r.json()).then(d => { if (d.books) allBooks.push(...d.books); }));
+            }
+            if (gm.polySeriesTickers && gm.polySeriesTickers.length) {
+                promises.push(fetch('/api/poly_orderbook', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({poly_tickers: gm.polySeriesTickers}),
+                }).then(r => r.json()).then(d => { if (d.books) allBooks.push(...d.books); }));
+            }
+        }
+        await Promise.all(promises);
+        renderOB(allBooks, 'esp-ob-content');
+        const ts = document.getElementById('esp-ob-last-update');
+        if (ts) ts.textContent = new Date().toLocaleTimeString();
+    } catch(e) {}
+}
+let espOBInterval = null;
+function espStartOB() { if (!espOBInterval) { espFetchOB(); espOBInterval = setInterval(espFetchOB, 3000); } }
+function espStopOB() { if (espOBInterval) { clearInterval(espOBInterval); espOBInterval = null; } }
 
 function espLog(msg) {
     const el = document.getElementById('esp-trade-log');
@@ -7959,7 +8056,7 @@ async function espPollAll() {
         for (const [key, g] of entries) {
             const ho = odds[key + '_home'];
             const ao = odds[key + '_away'];
-            const safeKey = key.replace(/[|\\]/g, '_');
+            const safeKey = key.replace(/\\|/g, '_');
 
             if ((ho == null || ao == null) && espTrading && g.lastHomeOdds != null) {
                 const locked = ho == null && ao == null ? 'BOTH' : (ho == null ? 'HOME' : 'AWAY');
@@ -10350,7 +10447,7 @@ def api_esports_fetch_games():
 
         away_k, home_k = None, None
         for text in [title, subtitle]:
-            match = re.search(r'the\s+(.+?)\s+vs\.?\s+(.+?)\s+(?:\w+\s+)?match', text, re.IGNORECASE)
+            match = re.search(r'the\s+(.+?)\s+vs\.?\s+(.+?)\s+(?:[-–].*?\s+)?match', text, re.IGNORECASE)
             if match:
                 away_k, home_k = match.group(1).strip(), match.group(2).strip()
                 break
@@ -10362,6 +10459,8 @@ def api_esports_fetch_games():
                 break
         if not away_k or not home_k:
             continue
+        away_k = re.split(r'\s+[-–]\s+', away_k)[0].strip()
+        home_k = re.split(r'\s+[-–]\s+', home_k)[0].strip()
 
         ticker = m.get('ticker', '')
         key = (home_k, away_k)
@@ -10374,7 +10473,7 @@ def api_esports_fetch_games():
         yes_team = home_k
         match_yes = re.match(r'^Will\s+(.+?)\s+win\b', title, re.IGNORECASE)
         if match_yes:
-            yes_name = match_yes.group(1).strip()
+            yes_name = re.split(r'\s+[-–]\s+', match_yes.group(1).strip())[0].strip()
             if yes_name.lower() == away_k.lower():
                 yes_team = away_k
             else:
@@ -10411,16 +10510,8 @@ def api_esports_fetch_games():
             if len(tokens) < 2:
                 continue
 
-            q = mkt.get('question', '') or event.get('title', '') or ''
-            match_vs = re.search(r'(.+?)\s+vs\.?\s+(.+)', q, re.IGNORECASE)
-            if match_vs:
-                away_p, home_p = match_vs.group(1).strip(), match_vs.group(2).strip()
-            else:
-                away_p, home_p = team_a, team_b
-
-            away_p = re.sub(r'\s*\(.*?\)\s*$', '', away_p).strip()
-            home_p = re.sub(r'\s*\(.*?\)\s*$', '', home_p).strip()
-            away_p = re.sub(r'^(?:Will\s+)', '', away_p, flags=re.IGNORECASE).strip()
+            away_p = team_a.strip()
+            home_p = team_b.strip()
 
             key = (home_p, away_p)
             rkey = (away_p, home_p)
