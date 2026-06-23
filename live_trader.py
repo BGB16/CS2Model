@@ -2597,6 +2597,7 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
                     <option value="valorant">Valorant</option>
                     <option value="lol">League of Legends</option>
                     <option value="dota2">Dota 2</option>
+                    <option value="r6">Rainbow Six Siege</option>
                 </select>
             </div>
             <div class="input-group">
@@ -2627,6 +2628,7 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
 
         <div id="esp-tracked-games" style="margin-bottom:8px;"></div>
         <div id="esp-trade-log" style="display:none;max-height:120px;overflow-y:auto;margin-bottom:8px;padding:4px 8px;background:#0a0a1a;border:1px solid #333;border-radius:4px;font-family:monospace;font-size:11px;color:#888;"></div>
+        <div id="esp-results" style="margin-bottom:8px;"></div>
 
         <div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
             <button class="btn" id="esp-stream-toggle" onclick="espToggleStream()" style="padding:4px 12px;font-size:11px;background:#333;">Live View</button>
@@ -7829,8 +7831,8 @@ function espRemoveGame(key) {
     espFetchOB();
 }
 
-const ESP_ESPORT_LABELS = {valorant: 'VAL', lol: 'LoL', dota2: 'Dota'};
-const ESP_ESPORT_COLORS = {valorant: '#ff4655', lol: '#c89b3c', dota2: '#e44d2e'};
+const ESP_ESPORT_LABELS = {valorant: 'VAL', lol: 'LoL', dota2: 'Dota', r6: 'R6'};
+const ESP_ESPORT_COLORS = {valorant: '#ff4655', lol: '#c89b3c', dota2: '#e44d2e', r6: '#f5a623'};
 
 function espRenderTrackedGames() {
     const el = document.getElementById('esp-tracked-games');
@@ -7938,6 +7940,25 @@ async function espFetchOB() {
 let espOBInterval = null;
 function espStartOB() { if (!espOBInterval) { espFetchOB(); espOBInterval = setInterval(espFetchOB, 3000); } }
 function espStopOB() { if (espOBInterval) { clearInterval(espOBInterval); espOBInterval = null; } }
+
+function espRenderResults(data) {
+    const el = document.getElementById('esp-results');
+    if (!el) return;
+    let html = '';
+    if (data.cancelled) html += '<div class="alert alert-info">Cancelled existing orders first</div>';
+    if (data.message) html += '<div class="alert alert-success">' + data.message + '</div>';
+    if (data.orders && data.orders.length > 0) {
+        html += '<table class="orders-table"><thead><tr><th>Selection</th><th>Price</th><th>Qty</th><th>Status</th></tr></thead><tbody>';
+        for (const o of data.orders) {
+            const cls = (o.status === 'placed' || o.status === 'filled') ? 'placed' : 'failed';
+            let st = o.status.toUpperCase();
+            if (o.filled !== undefined) st = o.filled + '/' + o.contracts + ' FILLED';
+            html += '<tr><td>' + o.team + '</td><td>' + o.price + 'c</td><td>' + o.contracts + '</td><td class="status-' + cls + '">' + st + '</td></tr>';
+        }
+        html += '</tbody></table>';
+    }
+    el.innerHTML = html;
+}
 
 function espLog(msg) {
     const el = document.getElementById('esp-trade-log');
@@ -8059,24 +8080,24 @@ async function espPollAll() {
             const safeKey = key.replace(/\\|/g, '_');
 
             if ((ho == null || ao == null) && espTrading && g.lastHomeOdds != null) {
-                const locked = ho == null && ao == null ? 'BOTH' : (ho == null ? 'HOME' : 'AWAY');
                 if (!g.locked) {
+                    const locked = ho == null && ao == null ? 'BOTH' : (ho == null ? 'HOME' : 'AWAY');
                     espLog('<span style="color:#ff5252;font-weight:bold;">LOCKED (' + locked + ') — EMERGENCY CANCEL ' + key + '</span>');
                     g.locked = true;
-                }
-                if (g.makerTimer) { clearTimeout(g.makerTimer); g.makerTimer = null; }
-                g.pendingMakerFair = null;
-                g.tradeBusy = true;
-                const gm = g.game;
-                if (gm.tickers && gm.tickers.length) {
-                    fetch('/api/cancel_all', {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({tickers: gm.tickers}),
-                    }).then(() => {
-                        espLog('<span style="color:#ffa726;">CANCEL CONFIRMED for ' + key + '</span>');
-                    }).catch(() => {}).finally(() => { g.tradeBusy = false; });
-                } else {
-                    g.tradeBusy = false;
+                    if (g.makerTimer) { clearTimeout(g.makerTimer); g.makerTimer = null; }
+                    g.pendingMakerFair = null;
+                    g.tradeBusy = true;
+                    const gm = g.game;
+                    if (gm.tickers && gm.tickers.length) {
+                        fetch('/api/cancel_all', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({tickers: gm.tickers}),
+                        }).then(() => {
+                            espLog('<span style="color:#ffa726;">CANCEL CONFIRMED for ' + key + '</span>');
+                        }).catch(() => {}).finally(() => { g.tradeBusy = false; });
+                    } else {
+                        g.tradeBusy = false;
+                    }
                 }
             }
             if (ho != null && ao != null) {
@@ -8156,6 +8177,7 @@ async function espPollAll() {
                                 }),
                             }).then(r => r.json()).then(d => {
                                 if (d.orders && d.orders.length) {
+                                    espRenderResults(d);
                                     const fills = d.orders.filter(o => o.status === 'filled' || (o.filled && o.filled > 0));
                                     if (fills.length) {
                                         playFillSound();
@@ -8182,6 +8204,7 @@ async function espPollAll() {
                             }),
                         }).then(r => r.json()).then(d => {
                             if (d.orders && d.orders.length) {
+                                espRenderResults(d);
                                 const fills = d.orders.filter(o => o.status === 'filled' || (o.filled && o.filled > 0));
                                 if (fills.length) {
                                     playFillSound();
@@ -10362,15 +10385,17 @@ def api_ws_subscribe():
 # ── Esports Market Fetch API ──────────────────────────────────────────
 
 ESPORT_KALSHI_SERIES = {
-    'valorant': ['KXVALWIN'],
-    'lol': ['KXLOLWIN'],
-    'dota2': ['KXDOTAWIN'],
+    'valorant': ['KXVALORANTGAME', 'KXVALORANT'],
+    'lol': ['KXLOLGAME', 'KXLOL'],
+    'dota2': ['KXDOTA2GAME'],
+    'r6': ['KXR6GAME'],
 }
 
 ESPORT_POLY_SLUGS = {
     'valorant': 'valorant',
     'lol': 'league-of-legends',
     'dota2': 'dota-2',
+    'r6': 'rainbow-six-siege',
 }
 
 
@@ -10461,9 +10486,17 @@ def api_esports_fetch_games():
             continue
         away_k = re.split(r'\s+[-–]\s+', away_k)[0].strip()
         home_k = re.split(r'\s+[-–]\s+', home_k)[0].strip()
+        for _gsuf in ['CS2', 'Dota 2', 'Valorant', 'League of Legends', 'LoL', 'Rainbow Six Siege', 'R6']:
+            if away_k.endswith(' ' + _gsuf):
+                away_k = away_k[:-len(_gsuf)-1].strip()
+            if home_k.endswith(' ' + _gsuf):
+                home_k = home_k[:-len(_gsuf)-1].strip()
 
         ticker = m.get('ticker', '')
         key = (home_k, away_k)
+        rkey = (away_k, home_k)
+        if rkey in result and key not in result:
+            key = rkey
         if key not in result:
             result[key] = {
                 'home': home_k, 'away': away_k,
@@ -10532,7 +10565,7 @@ def api_esports_fetch_games():
                 'price_a': price_a, 'price_b': price_b,
                 'title': mkt.get('question', ''),
                 'platform': 'poly',
-                'tick_size': float(mkt.get('minimum_tick_size', '0.01')),
+                'tick_size': str(mkt.get('minimum_tick_size', '0.01')),
                 'neg_risk': mkt.get('negRisk', False),
             })
 

@@ -137,7 +137,7 @@ class ScreenTracker:
             return {'error': str(e)}
 
     def ocr_decimal_odds(self, img):
-        img = img.resize((img.width * 3, img.height * 3), Image.BILINEAR)
+        img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
         gray = ImageOps.grayscale(img)
         cfg = '--psm 7 -c tessedit_char_whitelist=0123456789.'
         bw = gray.point(lambda x: 255 if x > 120 else 0)
@@ -157,7 +157,7 @@ class ScreenTracker:
         return None
 
     def ocr_text(self, img):
-        img = img.resize((img.width * 3, img.height * 3), Image.BILINEAR)
+        img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
         gray = ImageOps.grayscale(img)
         cfg = '--psm 7'
         bw = gray.point(lambda x: 255 if x > 120 else 0)
