@@ -57,7 +57,7 @@ PEM="/Users/blakegordon/PycharmProjects/CBAModel/key.pem"
 python3 kalshi_edge.py limit --spread 6 --contracts 50 --max-contracts 100 --max-position 100 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem
 
 # --- HOUSE MODE (no book — fair minus spread only) ---
-python3 kalshi_edge.py limit --no-book --spread 5 --contracts 75 --max-contracts 300 --max-position 300 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt --poly-contracts 100
+python3 kalshi_edge.py limit --no-book --spread 5 --contracts 50 --max-contracts 600 --max-position 600 --api-key-id 90ca9f68-5585-499e-93ca-e7bfbbce2147 --private-key-path key.pem --poly-key-path /Users/blakegordon/PycharmProjects/CBAModel/poly_secret.txt --poly-contracts 200
 
 
 # --- HOUSE MODE LOOP (every 10 min, cancels stale + reposts) ---

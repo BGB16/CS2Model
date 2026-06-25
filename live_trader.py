@@ -7144,24 +7144,24 @@ async function sctPollAll() {
             const safeKey = key.replace(/\\|/g, '_');
 
             if ((ho == null || ao == null) && screenTrading && g.lastHomeOdds != null) {
-                const locked = ho == null && ao == null ? 'BOTH' : (ho == null ? 'HOME' : 'AWAY');
-                if (!g.locked) {
-                    sctLog('<span style="color:#ff5252;font-weight:bold;">LOCKED (' + locked + ') — EMERGENCY CANCEL ' + key + '</span>');
-                    g.locked = true;
-                }
                 if (g.makerTimer) { clearTimeout(g.makerTimer); g.makerTimer = null; }
                 g.pendingMakerFair = null;
-                g.tradeBusy = true;
-                const gm = g.game;
-                if (gm.tickers && gm.tickers.length) {
-                    fetch('/api/cancel_all', {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({tickers: gm.tickers}),
-                    }).then(() => {
-                        sctLog('<span style="color:#ffa726;">CANCEL CONFIRMED for ' + key + '</span>');
-                    }).catch(() => {}).finally(() => { g.tradeBusy = false; });
-                } else {
-                    g.tradeBusy = false;
+                if (!g.locked) {
+                    g.locked = true;
+                    const locked = ho == null && ao == null ? 'BOTH' : (ho == null ? 'HOME' : 'AWAY');
+                    sctLog('<span style="color:#ff5252;font-weight:bold;">LOCKED (' + locked + ') — EMERGENCY CANCEL ' + key + '</span>');
+                    g.tradeBusy = true;
+                    const gm = g.game;
+                    if (gm.tickers && gm.tickers.length) {
+                        fetch('/api/cancel_all', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({tickers: gm.tickers}),
+                        }).then(() => {
+                            sctLog('<span style="color:#ffa726;">CANCEL CONFIRMED for ' + key + '</span>');
+                        }).catch(() => {}).finally(() => { g.tradeBusy = false; });
+                    } else {
+                        g.tradeBusy = false;
+                    }
                 }
             }
             if (ho != null && ao != null) {
