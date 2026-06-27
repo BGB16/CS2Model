@@ -246,8 +246,6 @@ def resolve_team_name(query, encoders):
         if filtered:
             filtered.sort(key=lambda n: -len(n))
             return filtered[0]
-        substring_matches.sort(key=lambda n: -len(n))
-        return substring_matches[0]
 
     query_tokens = set(query_lower.split())
     best_score, best_name = 0, None

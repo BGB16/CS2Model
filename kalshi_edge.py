@@ -293,8 +293,6 @@ def match_kalshi_team(kalshi_name, our_teams):
         if filtered:
             filtered.sort(key=lambda t: -len(normalize_name(t)))
             return filtered[0]
-        matches.sort(key=lambda t: -len(normalize_name(t)))
-        return matches[0]
     # Token overlap — require majority of tokens match
     norm_tokens = set(norm.split())
     for t in our_teams:

@@ -60,6 +60,9 @@ KALSHI_WS = None
 KALSHI_WS_FILLS = []
 KALSHI_WS_FILLS_LOCK = threading.Lock()
 
+SCREEN_TRADE_FILLS = []
+SCREEN_TRADE_FILLS_LOCK = threading.Lock()
+
 app = Flask(__name__)
 
 
@@ -1426,7 +1429,7 @@ def place_ioc_order(ticker, side, count, price_cents):
     }
     headers = make_auth_headers(PRIVATE_KEY, API_KEY_ID, 'POST', path)
     try:
-        resp = http_requests.post(url, headers=headers, json=order, timeout=10)
+        resp = http_requests.post(url, headers=headers, json=order, timeout=3)
     except Exception as e:
         print(f"      IOC FAILED: {e}")
         return 0, count
@@ -2586,7 +2589,7 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
     <div id="tab-esports" style="display:none;">
         <h2 style="color:#e040fb; margin-bottom:8px;">Esports Screen Trader</h2>
         <p style="font-size:12px; color:#888; margin-bottom:10px;">
-            Track live odds via screen capture for Valorant, LoL, and Dota 2 matches. Add games, mark odds regions, and trade.
+            Track live odds via screen capture for CS2, Valorant, LoL, and Dota 2 matches. Add games, mark odds regions, and trade.
         </p>
 
         <div style="display:flex; gap:8px; align-items:flex-end; margin-bottom:10px; flex-wrap:wrap;">
@@ -2594,6 +2597,7 @@ h2 { color: #81c784; margin: 10px 0 6px; font-size: 16px; }
                 <label style="font-size:11px;">Esport</label>
                 <select id="esp-esport" onchange="espOnEsportChange()" style="width:160px;padding:5px 8px;font-size:12px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px;">
                     <option value="">-- Select --</option>
+                    <option value="cs2">CS2</option>
                     <option value="valorant">Valorant</option>
                     <option value="lol">League of Legends</option>
                     <option value="dota2">Dota 2</option>
@@ -6986,16 +6990,30 @@ function sctAdjustBoost(key, delta) {
 function playFillSound() {
     try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.frequency.value = 880;
-        osc.type = 'sine';
-        gain.gain.value = 0.3;
-        osc.start();
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
-        osc.stop(ctx.currentTime + 0.3);
+        if (ctx.state === 'suspended') ctx.resume();
+        const notes = [660, 880, 1320];
+        for (let i = 0; i < notes.length; i++) {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.frequency.value = notes[i];
+            osc.type = 'sine';
+            gain.gain.setValueAtTime(0.5, ctx.currentTime + i * 0.12);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.12 + 0.18);
+            osc.start(ctx.currentTime + i * 0.12);
+            osc.stop(ctx.currentTime + i * 0.12 + 0.18);
+        }
+        let banner = document.getElementById('fill-flash-banner');
+        if (!banner) {
+            banner = document.createElement('div');
+            banner.id = 'fill-flash-banner';
+            banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;text-align:center;font:bold 22px monospace;color:#000;padding:10px;pointer-events:none;opacity:0;transition:opacity 0.15s;background:#4caf50;';
+            document.body.appendChild(banner);
+        }
+        banner.textContent = 'FILL';
+        banner.style.opacity = '1';
+        setTimeout(() => { banner.style.opacity = '0'; }, 1200);
     } catch(e) {}
 }
 
@@ -7089,6 +7107,7 @@ async function stopScreenTrade() {
 }
 
 let lastWsFillCount = 0;
+let lastScreenFillCount = 0;
 // ── Poll loop: single state fetch, process all games ──
 async function sctPollAll() {
     const entries = Object.entries(sctTrackedGames);
@@ -7108,6 +7127,14 @@ async function sctPollAll() {
                 for (const f of newFills) {
                     const tag = f.is_taker ? 'TAKER' : 'MAKER';
                     sctLog('<span style="color:#ff9800;">[WS FILL] ' + tag + ' ' + f.side + ' ' + f.count + '@' + f.price + ' ' + f.ticker.split('-').pop() + '</span>');
+                    playFillSound();
+                }
+            }
+            if (ws.screen_fills && ws.screen_fills.length > lastScreenFillCount) {
+                const newFills = ws.screen_fills.slice(lastScreenFillCount);
+                lastScreenFillCount = ws.screen_fills.length;
+                for (const f of newFills) {
+                    sctLog('<span style="color:#4caf50;font-weight:bold;">[FILL] ' + f.ticker + ' ' + f.count + '@' + f.price + 'c</span>');
                     playFillSound();
                 }
             }
@@ -7278,6 +7305,7 @@ async function sctPollAll() {
                                 }
                             }
                         }).catch(e => { sctLog('<span style="color:#ff5252;">ERROR: ' + e + '</span>'); }).finally(() => { g.tradeBusy = false; });
+                        if (screenTradeMode === 'ioc') g.tradeBusy = false;
                     } else if (tradeSide === 'none') {
                         sctLog('<span style="color:#555;">no trade (side=none)</span>');
                     } else if (g.tradeBusy) {
@@ -7313,6 +7341,7 @@ let espTradePoll = null;
 let espTradeMode = 'ioc';
 let espTrackedGames = {};
 let espLastWsFillCount = 0;
+let espLastScreenFillCount = 0;
 
 function espUpdateTransform() {
     const inner = document.getElementById('esp-screen-inner');
@@ -7831,8 +7860,8 @@ function espRemoveGame(key) {
     espFetchOB();
 }
 
-const ESP_ESPORT_LABELS = {valorant: 'VAL', lol: 'LoL', dota2: 'Dota', r6: 'R6'};
-const ESP_ESPORT_COLORS = {valorant: '#ff4655', lol: '#c89b3c', dota2: '#e44d2e', r6: '#f5a623'};
+const ESP_ESPORT_LABELS = {cs2: 'CS2', valorant: 'VAL', lol: 'LoL', dota2: 'Dota', r6: 'R6'};
+const ESP_ESPORT_COLORS = {cs2: '#66bb6a', valorant: '#ff4655', lol: '#c89b3c', dota2: '#e44d2e', r6: '#f5a623'};
 
 function espRenderTrackedGames() {
     const el = document.getElementById('esp-tracked-games');
@@ -8048,6 +8077,14 @@ async function espPollAll() {
                     playFillSound();
                 }
             }
+            if (ws.screen_fills && ws.screen_fills.length > espLastScreenFillCount) {
+                const newFills = ws.screen_fills.slice(espLastScreenFillCount);
+                espLastScreenFillCount = ws.screen_fills.length;
+                for (const f of newFills) {
+                    espLog('<span style="color:#4caf50;font-weight:bold;">[FILL] ' + f.ticker + ' ' + f.count + '@' + f.price + 'c</span>');
+                    playFillSound();
+                }
+            }
         }).catch(() => {});
     }
 
@@ -8212,6 +8249,7 @@ async function espPollAll() {
                                 }
                             }
                         }).catch(e => { espLog('<span style="color:#ff5252;">ERROR: ' + e + '</span>'); }).finally(() => { g.tradeBusy = false; });
+                        if (espTradeMode === 'ioc') g.tradeBusy = false;
                     } else if (tradeSide === 'none') {
                         espLog('<span style="color:#555;">no trade (side=none)</span>');
                     } else if (g.tradeBusy) {
@@ -8316,15 +8354,17 @@ def _post_poly_live_orders(poly_tickers, home_fair_cents, home, away,
         # token_a corresponds to team_a, token_b to team_b.
         home_lower = home.lower()
         away_lower = away.lower()
+        ta_lower = team_a.lower()
+        tb_lower = team_b.lower()
         ph = (poly_home or '').lower()
         pa = (poly_away or '').lower()
-        if ph == home_lower or pa == away_lower:
+        if ta_lower == home_lower or tb_lower == away_lower:
+            is_model_home_a = True
+        elif tb_lower == home_lower or ta_lower == away_lower:
+            is_model_home_a = False
+        elif ph == home_lower or pa == away_lower:
             is_model_home_a = True
         elif ph == away_lower or pa == home_lower:
-            is_model_home_a = False
-        elif team_a.lower() == home_lower or team_b.lower() == away_lower:
-            is_model_home_a = True
-        elif team_b.lower() == home_lower or team_a.lower() == away_lower:
             is_model_home_a = False
         else:
             is_model_home_a = (poly_home == team_a)
@@ -8337,59 +8377,81 @@ def _post_poly_live_orders(poly_tickers, home_fair_cents, home, away,
         print(f"[POLY] Token mapping: model_home={home} -> poly={name_model_home} (token_{'a' if is_model_home_a else 'b'}) | "
               f"model_away={away} -> poly={name_model_away}")
 
-        with ThreadPoolExecutor(max_workers=2) as ob_pool:
-            fh = ob_pool.submit(get_poly_orderbook, token_model_home)
-            fa = ob_pool.submit(get_poly_orderbook, token_model_away)
-            ob_h = fh.result()
-            ob_a = fa.result()
-        best_bid_h = poly_best_bid(ob_h)
-        best_bid_a = poly_best_bid(ob_a)
-        ask_h_c = int(round(poly_best_ask(ob_h) * 100))
-        ask_a_c = int(round(poly_best_ask(ob_a) * 100))
-
-        # Home side
         hb = max(1, home_spread_bid)
-        if not ioc:
+        if hb > home_fair_cents:
+            hb = home_fair_cents
+        ab = max(1, away_spread_bid)
+        if ab > away_fair_cents:
+            ab = away_fair_cents
+
+        if ioc:
+            print(f"[POLY] {name_model_home}: fair={home_fair_cents}c bid={hb}c skip={skip_home} | "
+                  f"{name_model_away}: fair={away_fair_cents}c bid={ab}c skip={skip_away}")
+
+            def _poly_ioc(team_name, token_id, bid_cents, fair_cents, skip_flag):
+                if skip_flag or not (1 <= bid_cents <= 99):
+                    return None
+                if DRY_RUN or not POLY_CLIENT:
+                    return {'team': f'{team_name} YES (Poly)', 'price': bid_cents,
+                            'contracts': contracts, 'status': 'dry-run'}
+                price = round(bid_cents / 100.0, 2)
+                print(f"[POLY] FOK {team_name} {contracts} shares @ {price} (fair={fair_cents}c)")
+                resp = POLY_CLIENT.place_order(
+                    token_id, "BUY", price, contracts,
+                    tick_size=tick_size, neg_risk=neg_risk, order_type="FOK")
+                if resp and isinstance(resp, dict):
+                    status = resp.get('status', '')
+                    filled = status.lower() in ('matched', 'filled')
+                    print(f"[POLY] FOK result: {team_name} status={status} filled={filled}")
+                    return {'team': f'{team_name} YES (Poly)', 'price': bid_cents,
+                            'contracts': contracts,
+                            'status': 'filled' if filled else 'not_filled'}
+                return {'team': f'{team_name} YES (Poly)', 'price': bid_cents,
+                        'contracts': contracts, 'status': 'failed'}
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = []
+                futures.append(pool.submit(_poly_ioc, name_model_home, token_model_home,
+                                           hb, home_fair_cents, skip_home))
+                futures.append(pool.submit(_poly_ioc, name_model_away, token_model_away,
+                                           ab, away_fair_cents, skip_away))
+                for f in as_completed(futures):
+                    result = f.result()
+                    if result:
+                        orders.append(result)
+        else:
+            with ThreadPoolExecutor(max_workers=2) as ob_pool:
+                fh = ob_pool.submit(get_poly_orderbook, token_model_home)
+                fa = ob_pool.submit(get_poly_orderbook, token_model_away)
+                ob_h = fh.result()
+                ob_a = fa.result()
+            best_bid_h = poly_best_bid(ob_h)
+            best_bid_a = poly_best_bid(ob_a)
+            ask_h_c = int(round(poly_best_ask(ob_h) * 100))
+            ask_a_c = int(round(poly_best_ask(ob_a) * 100))
+
             if best_bid_h > 0:
                 hb = min(hb, int(round(best_bid_h * 100)) + 1)
             if hb >= ask_h_c > 0:
                 hb = ask_h_c - 1
-        if hb > home_fair_cents:
-            hb = home_fair_cents
-
-        # Away side
-        ab = max(1, away_spread_bid)
-        if not ioc:
+            if hb > home_fair_cents:
+                hb = home_fair_cents
             if best_bid_a > 0:
                 ab = min(ab, int(round(best_bid_a * 100)) + 1)
             if ab >= ask_a_c > 0:
                 ab = ask_a_c - 1
-        if ab > away_fair_cents:
-            ab = away_fair_cents
+            if ab > away_fair_cents:
+                ab = away_fair_cents
 
-        print(f"[POLY] {name_model_home} (model home): fair={home_fair_cents}c bid={hb}c ask={ask_h_c}c skip={skip_home}")
-        print(f"[POLY] {name_model_away} (model away): fair={away_fair_cents}c bid={ab}c ask={ask_a_c}c skip={skip_away}")
+            print(f"[POLY] {name_model_home} (model home): fair={home_fair_cents}c bid={hb}c ask={ask_h_c}c skip={skip_home}")
+            print(f"[POLY] {name_model_away} (model away): fair={away_fair_cents}c bid={ab}c ask={ask_a_c}c skip={skip_away}")
 
-        def _poly_side(team_name, token_id, bid_cents, fair_cents, skip_flag, best_ask_c):
-            if skip_flag or not (1 <= bid_cents <= 99):
-                return None
-            if DRY_RUN or not POLY_CLIENT:
-                return {'team': f'{team_name} YES (Poly)', 'price': bid_cents,
-                        'contracts': contracts, 'status': 'dry-run'}
-            if ioc:
-                if best_ask_c > bid_cents:
-                    print(f"[POLY] IOC SKIP {team_name}: ask={best_ask_c}c > bid={bid_cents}c")
+            def _poly_maker(team_name, token_id, bid_cents, fair_cents, skip_flag):
+                if skip_flag or not (1 <= bid_cents <= 99):
                     return None
-                take_price = round(best_ask_c / 100.0, 2)
-                print(f"[POLY] IOC TAKE {team_name} {contracts} shares @ {take_price} "
-                      f"(ask={best_ask_c}c bid={bid_cents}c fair={fair_cents}c)")
-                resp = POLY_CLIENT.place_order(
-                    token_id, "BUY", take_price, contracts,
-                    tick_size=tick_size, neg_risk=neg_risk, order_type="GTC")
-                return {'team': f'{team_name} YES (Poly)', 'price': best_ask_c,
-                        'contracts': contracts,
-                        'status': 'filled' if resp else 'failed'}
-            else:
+                if DRY_RUN or not POLY_CLIENT:
+                    return {'team': f'{team_name} YES (Poly)', 'price': bid_cents,
+                            'contracts': contracts, 'status': 'dry-run'}
                 POLY_CLIENT.cancel_token_orders(token_id)
                 price = round(bid_cents / 100.0, 2)
                 print(f"[POLY] GTC BUY {team_name} {contracts} shares @ {price}")
@@ -8402,16 +8464,16 @@ def _post_poly_live_orders(poly_tickers, home_fair_cents, home, away,
                         'contracts': contracts,
                         'status': 'placed' if resp else 'failed'}
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = []
-            futures.append(pool.submit(_poly_side, name_model_home, token_model_home,
-                                       hb, home_fair_cents, skip_home, ask_h_c))
-            futures.append(pool.submit(_poly_side, name_model_away, token_model_away,
-                                       ab, away_fair_cents, skip_away, ask_a_c))
-            for f in as_completed(futures):
-                result = f.result()
-                if result:
-                    orders.append(result)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = []
+                futures.append(pool.submit(_poly_maker, name_model_home, token_model_home,
+                                           hb, home_fair_cents, skip_home))
+                futures.append(pool.submit(_poly_maker, name_model_away, token_model_away,
+                                           ab, away_fair_cents, skip_away))
+                for f in as_completed(futures):
+                    result = f.result()
+                    if result:
+                        orders.append(result)
 
     if orders:
         print(f"[POLY] Posted {len(orders)} orders: " +
@@ -10360,14 +10422,17 @@ def api_swiss_simulate():
 
 @app.route('/api/ws_status')
 def api_ws_status():
+    with SCREEN_TRADE_FILLS_LOCK:
+        st_fills = list(SCREEN_TRADE_FILLS[-20:])
     if not KALSHI_WS:
-        return jsonify({'connected': False, 'tickers': [], 'fills': []})
+        return jsonify({'connected': False, 'tickers': [], 'fills': [], 'screen_fills': st_fills})
     with KALSHI_WS_FILLS_LOCK:
         recent = list(KALSHI_WS_FILLS[-20:])
     return jsonify({
         'connected': KALSHI_WS.connected,
         'tickers': list(KALSHI_WS.subscribed_tickers),
         'fills': recent,
+        'screen_fills': st_fills,
     })
 
 
@@ -10385,6 +10450,7 @@ def api_ws_subscribe():
 # ── Esports Market Fetch API ──────────────────────────────────────────
 
 ESPORT_KALSHI_SERIES = {
+    'cs2': ['KXCS2GAME'],
     'valorant': ['KXVALORANTGAME', 'KXVALORANT'],
     'lol': ['KXLOLGAME', 'KXLOL'],
     'dota2': ['KXDOTA2GAME'],
@@ -10392,6 +10458,7 @@ ESPORT_KALSHI_SERIES = {
 }
 
 ESPORT_POLY_SLUGS = {
+    'cs2': 'counter-strike',
     'valorant': 'valorant',
     'lol': 'league-of-legends',
     'dota2': 'dota-2',
@@ -10762,25 +10829,57 @@ def api_screen_trade():
     results = []
 
     if mode == 'maker':
-        if tickers:
-            ticker_names = [t['ticker'] for t in tickers]
-            cancel_all_live_orders(tickers=ticker_names)
-            results.extend(post_live_orders(
-                tickers, home_fair_cents, contracts, spread_cents,
-                home, away, trade_side))
-    else:
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = []
             if tickers:
-                futures.append(pool.submit(post_ioc_orders,
+                ticker_names = [t['ticker'] for t in tickers]
+                cancel_all_live_orders(tickers=ticker_names)
+                futures.append(pool.submit(post_live_orders,
                     tickers, home_fair_cents, contracts, spread_cents,
                     home, away, trade_side))
             if poly_tickers:
                 futures.append(pool.submit(_post_poly_live_orders,
                     poly_tickers, home_fair_cents, home, away,
-                    contracts, spread_cents, True, trade_side))
+                    contracts, spread_cents, False, trade_side))
             for f in as_completed(futures):
                 results.extend(f.result())
+    else:
+        def _bg_ioc():
+            ioc_results = []
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = []
+                if tickers:
+                    futures.append(pool.submit(post_ioc_orders,
+                        tickers, home_fair_cents, contracts, spread_cents,
+                        home, away, trade_side))
+                if poly_tickers:
+                    futures.append(pool.submit(_post_poly_live_orders,
+                        poly_tickers, home_fair_cents, home, away,
+                        contracts, spread_cents, True, trade_side))
+                for f in as_completed(futures):
+                    ioc_results.extend(f.result())
+            fills = [r for r in ioc_results if r.get('filled', 0) > 0 or r.get('status') == 'filled']
+            if fills:
+                with SCREEN_TRADE_FILLS_LOCK:
+                    for fl in fills:
+                        SCREEN_TRADE_FILLS.append({
+                            'side': 'yes', 'count': fl.get('filled', fl.get('contracts', 0)),
+                            'price': fl.get('price', 0), 'ticker': fl.get('team', ''),
+                            'is_taker': True, 'source': 'ioc',
+                        })
+                    if len(SCREEN_TRADE_FILLS) > 100:
+                        SCREEN_TRADE_FILLS[:] = SCREEN_TRADE_FILLS[-100:]
+                for fl in fills:
+                    print(f"[IOC-BG] FILL: {fl['team']} @ {fl.get('price')}c")
+        threading.Thread(target=_bg_ioc, daemon=True).start()
+        return jsonify({
+            'home_odds': home_odds,
+            'away_odds': away_odds,
+            'home_fair': home_fair_cents,
+            'away_fair': 100 - home_fair_cents,
+            'orders': [],
+            'dispatched': True,
+        })
 
     return jsonify({
         'home_odds': home_odds,
