@@ -7,13 +7,18 @@ tracks changes over time, and detects drastic moves.
 Requirements:
   pip install mss pytesseract Pillow
   brew install tesseract
+  Optional (much faster): pip install tesserocr
 """
 import threading
 import time
 import re
 import io
+import os
 import base64
+import hashlib
 import collections
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import mss
@@ -28,6 +33,27 @@ try:
 except ImportError:
     HAS_PIL = False
 
+_TESSDATA_PATH = None
+try:
+    import tesserocr
+    HAS_TESSEROCR = True
+    _candidate = os.environ.get('TESSDATA_PREFIX', '')
+    if not _candidate or not os.path.isdir(_candidate):
+        try:
+            _prefix = subprocess.check_output(
+                ['brew', '--prefix', 'tesseract'],
+                stderr=subprocess.DEVNULL, timeout=2
+            ).decode().strip()
+            _candidate = os.path.join(_prefix, 'share', 'tessdata')
+        except Exception:
+            _candidate = '/opt/homebrew/opt/tesseract/share/tessdata'
+    if os.path.isdir(_candidate):
+        _TESSDATA_PATH = _candidate
+    else:
+        HAS_TESSEROCR = False
+except ImportError:
+    HAS_TESSEROCR = False
+
 try:
     import pytesseract
     HAS_TESSERACT = True
@@ -36,7 +62,7 @@ except ImportError:
 
 
 def _deps_available():
-    return HAS_MSS and HAS_PIL and HAS_TESSERACT
+    return HAS_MSS and HAS_PIL and (HAS_TESSEROCR or HAS_TESSERACT)
 
 
 def _missing_deps():
@@ -45,12 +71,14 @@ def _missing_deps():
         missing.append('mss')
     if not HAS_PIL:
         missing.append('Pillow')
-    if not HAS_TESSERACT:
-        missing.append('pytesseract + tesseract')
+    if not HAS_TESSEROCR and not HAS_TESSERACT:
+        missing.append('pytesseract + tesseract (or tesserocr for faster OCR)')
     return missing
 
 
 class ScreenTracker:
+    _OCR_POOL = ThreadPoolExecutor(max_workers=8)
+
     def __init__(self):
         self.scoreboard = None
         self.sub_regions = {}
@@ -67,6 +95,9 @@ class ScreenTracker:
         self._history = collections.deque(maxlen=500)
         self._sct = None
         self._sct_lock = threading.Lock()
+        self._crop_hashes = {}
+        self._crop_cache = {}
+        self._tess_api_local = threading.local()
 
     def _get_sct(self):
         if self._sct is None:
@@ -113,6 +144,8 @@ class ScreenTracker:
         with self._lock:
             self.scoreboard = region
             self.sub_regions = {}
+        self._crop_hashes.clear()
+        self._crop_cache.clear()
 
     def set_sub_region(self, name, region):
         with self._lock:
@@ -136,19 +169,44 @@ class ScreenTracker:
         except Exception as e:
             return {'error': str(e)}
 
+    def _get_tess_api(self, whitelist=None):
+        if not HAS_TESSEROCR:
+            return None
+        attr = '_api_odds' if whitelist else '_api_text'
+        api = getattr(self._tess_api_local, attr, None)
+        if api is None:
+            api = tesserocr.PyTessBaseAPI(path=_TESSDATA_PATH, psm=tesserocr.PSM.SINGLE_LINE)
+            if whitelist:
+                api.SetVariable('tessedit_char_whitelist', whitelist)
+            setattr(self._tess_api_local, attr, api)
+        return api
+
+    def _ocr_via_tesserocr(self, bw_img, whitelist=None):
+        api = self._get_tess_api(whitelist=whitelist)
+        if api is None:
+            return ''
+        api.SetImage(bw_img)
+        return api.GetUTF8Text().strip()
+
+    def _ocr_string(self, bw_img, cfg=None, whitelist=None):
+        if HAS_TESSEROCR:
+            return self._ocr_via_tesserocr(bw_img, whitelist=whitelist)
+        return pytesseract.image_to_string(bw_img, config=cfg).strip()
+
     def ocr_decimal_odds(self, img):
         img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
         gray = ImageOps.grayscale(img)
         cfg = '--psm 7 -c tessedit_char_whitelist=0123456789.'
+        wl = '0123456789.'
         bw = gray.point(lambda x: 255 if x > 120 else 0)
-        text = pytesseract.image_to_string(bw, config=cfg).strip()
+        text = self._ocr_string(bw, cfg=cfg, whitelist=wl)
         m = re.search(r'(\d+\.\d{1,2})', text)
         if m:
             val = float(m.group(1))
             if 1.0 <= val <= 100.0:
                 return val
         bw = ImageOps.invert(gray).point(lambda x: 255 if x > 120 else 0)
-        text = pytesseract.image_to_string(bw, config=cfg).strip()
+        text = self._ocr_string(bw, cfg=cfg, whitelist=wl)
         m = re.search(r'(\d+\.\d{1,2})', text)
         if m:
             val = float(m.group(1))
@@ -161,14 +219,32 @@ class ScreenTracker:
         gray = ImageOps.grayscale(img)
         cfg = '--psm 7'
         bw = gray.point(lambda x: 255 if x > 120 else 0)
-        text = pytesseract.image_to_string(bw, config=cfg).strip()
+        text = self._ocr_string(bw, cfg=cfg)
         if text:
             return text
         bw = ImageOps.invert(gray).point(lambda x: 255 if x > 120 else 0)
-        text = pytesseract.image_to_string(bw, config=cfg).strip()
+        text = self._ocr_string(bw, cfg=cfg)
         if text:
             return text
         return None
+
+    @staticmethod
+    def _crop_hash(crop):
+        return hashlib.md5(crop.tobytes()).digest()
+
+    def _ocr_sub_region(self, key, crop):
+        h = self._crop_hash(crop)
+        prev_hash = self._crop_hashes.get(key)
+        if prev_hash == h and key in self._crop_cache:
+            return key, self._crop_cache[key], 'cached'
+        self._crop_hashes[key] = h
+
+        if key.endswith('_label'):
+            val = self.ocr_text(crop)
+        else:
+            val = self.ocr_decimal_odds(crop)
+        self._crop_cache[key] = val
+        return key, val, 'ok' if val is not None else 'failed'
 
     def capture_once(self):
         state = {}
@@ -188,31 +264,35 @@ class ScreenTracker:
         sx = pw / sb['w'] if sb['w'] else 1
         sy = ph / sb['h'] if sb['h'] else 1
 
-        labels = {}
+        crops = {}
         for key, sr in self.sub_regions.items():
             try:
-                crop = sb_img.crop((
+                crops[key] = sb_img.crop((
                     int(sr['x'] * sx), int(sr['y'] * sy),
                     int((sr['x'] + sr['w']) * sx), int((sr['y'] + sr['h']) * sy),
                 ))
-                if key.endswith('_label'):
-                    val = self.ocr_text(crop)
-                    raw[key] = val
-                    if val is not None:
-                        labels[key] = val
-                        conf[key] = 'ok'
-                    else:
-                        conf[key] = 'failed'
-                else:
-                    val = self.ocr_decimal_odds(crop)
-                    raw[key] = val
-                    if val is not None:
-                        state[key] = val
-                        conf[key] = 'ok'
-                    else:
-                        conf[key] = 'failed'
             except Exception as e:
                 raw[key] = f'crop error: {e}'
+                conf[key] = 'error'
+
+        futures = {
+            key: self._OCR_POOL.submit(self._ocr_sub_region, key, crop)
+            for key, crop in crops.items()
+        }
+
+        labels = {}
+        for key, fut in futures.items():
+            try:
+                _, val, status = fut.result(timeout=5)
+                raw[key] = val
+                conf[key] = status
+                if val is not None:
+                    if key.endswith('_label'):
+                        labels[key] = val
+                    else:
+                        state[key] = val
+            except Exception as e:
+                raw[key] = f'ocr error: {e}'
                 conf[key] = 'error'
 
         with self._lock:
@@ -241,12 +321,16 @@ class ScreenTracker:
                 'confidence': {},
             }
         self._history.clear()
+        self._crop_hashes.clear()
+        self._crop_cache.clear()
 
     def remove_sub_regions(self, prefix):
         with self._lock:
             to_remove = [k for k in self.sub_regions if k.startswith(prefix)]
             for k in to_remove:
                 del self.sub_regions[k]
+                self._crop_hashes.pop(k, None)
+                self._crop_cache.pop(k, None)
 
     def start(self, interval=1.0, on_update=None):
         if self._running:
@@ -254,6 +338,8 @@ class ScreenTracker:
         self._interval = interval
         self._on_update = on_update
         self._running = True
+        backend = 'tesserocr (in-process)' if HAS_TESSEROCR else 'pytesseract (subprocess)'
+        print(f"[ScreenTracker] Starting with OCR backend: {backend}, interval: {interval}s")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
